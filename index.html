@@ -117,7 +117,7 @@
                             <span class="px-3 py-1 bg-green-100 text-green-700 text-xs font-semibold rounded-full mb-4 inline-block">พบข้อมูลจริงแล้ว</span>
                             <h1 class="text-3xl md:text-4xl font-bold text-gray-800 mb-2">Care Dashboard</h1>
                             <p class="text-gray-600 mb-6 max-w-lg">ระบบติดตามการดูแล บันทึกการเยี่ยม และวิเคราะห์ข้อมูลผู้มีภาวะพึ่งพิง</p>
-                            <button class="admin-only flex items-center gap-2 bg-white border border-gray-200 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 shadow-sm transition">
+                            <button onclick="document.getElementById('import-modal').classList.remove('hidden')" class="admin-only flex items-center gap-2 bg-white border border-gray-200 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 shadow-sm transition">
                                 <i data-lucide="upload" class="w-4 h-4"></i> นำเข้า Excel หรือ CSV
                             </button>
                         </div>
@@ -290,13 +290,19 @@
                         <form id="add-patient-form" class="space-y-4">
                             <div><label class="block text-sm">เลขบัตร ปชช. (13 หลัก)</label><input type="text" id="p-pid" class="w-full border p-2 rounded" required></div>
                             <div><label class="block text-sm">ชื่อ-นามสกุล</label><input type="text" id="p-name" class="w-full border p-2 rounded" required></div>
-                            <div><label class="block text-sm">วันเกิด (พ.ศ. dd/mm/yyyy)</label><input type="text" id="p-birth" class="w-full border p-2 rounded" required></div>
-                            <div>
-                                <label class="block text-sm">เพศ</label>
-                                <select id="p-gender" class="w-full border p-2 rounded">
-                                    <option value="ชาย">ชาย</option>
-                                    <option value="หญิง">หญิง</option>
-                                </select>
+                            <div><label class="block text-sm">วันเกิด (พ.ศ. dd/mm/yyyy)</label><input type="text" id="p-birth" class="w-full border p-2 rounded bg-white" placeholder="เลือกวันเกิด" required></div>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-sm">เพศ</label>
+                                    <select id="p-gender" class="w-full border p-2 rounded">
+                                        <option value="ชาย">ชาย</option>
+                                        <option value="หญิง">หญิง</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-sm">รูปโปรไฟล์ (ถ้ามี)</label>
+                                    <input type="file" id="p-profile-img" accept="image/*" class="w-full border p-1 rounded text-sm">
+                                </div>
                             </div>
                             <div><label class="block text-sm">ที่อยู่ (บ้านเลขที่)</label><input type="text" id="p-address" class="w-full border p-2 rounded"></div>
                             <div><label class="block text-sm">หมู่ที่</label><input type="text" id="p-moo" class="w-full border p-2 rounded"></div>
@@ -323,6 +329,31 @@
                             <div><label class="block text-sm">หมู่ที่</label><input type="text" id="c-moo" class="w-full border p-2 rounded"></div>
                             <div><label class="block text-sm">เบอร์โทรศัพท์</label><input type="text" id="c-phone" class="w-full border p-2 rounded"></div>
                             <button type="submit" class="w-full btn-primary py-2 rounded-lg">บันทึกข้อมูล</button>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Import Modal -->
+                <div id="import-modal" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+                    <div class="bg-white rounded-2xl w-full max-w-md p-6">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-xl font-bold">นำเข้าข้อมูล (CSV)</h3>
+                            <button onclick="document.getElementById('import-modal').classList.add('hidden')"><i data-lucide="x"></i></button>
+                        </div>
+                        <form id="import-csv-form" class="space-y-4">
+                            <div>
+                                <label class="block text-sm mb-1">เลือกประเภทข้อมูล</label>
+                                <select id="import-type" class="w-full border p-2 rounded">
+                                    <option value="patients">ข้อมูลผู้ป่วย (Patients)</option>
+                                    <option value="caregivers">ข้อมูลผู้ดูแล (Care Givers)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-sm mb-1">เลือกไฟล์ CSV</label>
+                                <input type="file" id="import-file" accept=".csv" class="w-full border p-2 rounded" required>
+                                <p class="text-xs text-gray-500 mt-2">หมายเหตุ: ไฟล์ต้องมี Header แถวแรกที่ตรงกับรูปแบบของระบบ</p>
+                            </div>
+                            <button type="submit" class="w-full btn-primary py-2 rounded-lg">เริ่มนำเข้าข้อมูล</button>
                         </form>
                     </div>
                 </div>

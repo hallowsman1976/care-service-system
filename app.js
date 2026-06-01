@@ -2,7 +2,7 @@
 // CONFIGURATION
 // ------------------
 // นำ URL ที่ได้จากการ Deploy Apps Script มาใส่ตรงนี้
-const API_URL = "https://script.google.com/macros/s/AKfycbwAEJGrYFgQ2z3whJzkPleZUjqqeSnZP3iqt_NqqrunTPS3jRAz-9ZuHpkrlseSb9kC/exec"; 
+const API_URL = "YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL"; 
 
 // ------------------
 // STATE MANAGEMENT
@@ -135,6 +135,12 @@ function attachEventListeners() {
     document.getElementById('sidebar')?.classList.toggle('open');
   });
 
+  // Init Flatpickr for Patient Birthdate
+  flatpickr("#p-birth", {
+    dateFormat: "d/m/Y",
+    locale: "th"
+  });
+
   // Add Patient Form
   document.getElementById('add-patient-form')?.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -148,7 +154,42 @@ function attachEventListeners() {
       caregiverName: document.getElementById('p-cgname').value,
       phone: document.getElementById('p-phone').value
     };
-    showLoading();
+    
+    // Handle Profile Image Upload
+    const fileInput = document.getElementById('p-profile-img');
+    if (fileInput && fileInput.files.length > 0) {
+      const file = fileInput.files[0];
+      const reader = new FileReader();
+      
+      const filePromise = new Promise((resolve, reject) => {
+        reader.onload = async (event) => {
+          try {
+            const base64Data = event.target.result;
+            const res = await apiPost('uploadFileToDrive', {
+              base64Data: base64Data,
+              filename: file.name,
+              type: 'profile'
+            });
+            if(res.success) resolve(res.data.url);
+            else reject(new Error(res.message));
+          } catch(err) {
+            reject(err);
+          }
+        };
+        reader.readAsDataURL(file);
+      });
+
+      try {
+        Swal.fire({ title: 'กำลังอัปโหลดรูปภาพ...', allowOutsideClick: false, didOpen: () => { Swal.showLoading(); }});
+        data.profileImageUrl = await filePromise;
+      } catch(err) {
+        hideLoading();
+        Swal.fire('ผิดพลาด', 'อัปโหลดรูปไม่สำเร็จ: ' + err.message, 'error');
+        return;
+      }
+    }
+
+    Swal.fire({ title: 'กำลังบันทึกข้อมูล...', allowOutsideClick: false, didOpen: () => { Swal.showLoading(); }});
     const res = await apiPost('createPatient', data);
     hideLoading();
     if(res.success) {
@@ -203,6 +244,47 @@ function attachEventListeners() {
     } else {
       Swal.fire('ผิดพลาด', res.message, 'error');
     }
+  });
+
+  // Import CSV Form
+  document.getElementById('import-csv-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fileInput = document.getElementById('import-file');
+    const importType = document.getElementById('import-type').value;
+    
+    if (fileInput.files.length === 0) return;
+    
+    const file = fileInput.files[0];
+    const reader = new FileReader();
+    
+    reader.onload = async function(event) {
+      const text = event.target.result;
+      const rows = text.split(/\r?\n/).map(row => row.split(',').map(cell => cell.trim()));
+      // filter out empty rows
+      const validRows = rows.filter(row => row.length > 1 || (row.length === 1 && row[0] !== ""));
+      
+      showLoading();
+      try {
+        const action = importType === 'patients' ? 'importCSVPatients' : 'importCSVCareGivers';
+        const res = await apiPost(action, { csvData: validRows });
+        hideLoading();
+        
+        if (res.success) {
+          Swal.fire('สำเร็จ', `นำเข้าข้อมูลเรียบร้อยแล้ว\nเพิ่ม: ${res.data.added} รายการ\nอัปเดต: ${res.data.updated} รายการ`, 'success');
+          document.getElementById('import-modal').classList.add('hidden');
+          document.getElementById('import-csv-form').reset();
+          if (importType === 'patients') loadPatients();
+          else if (importType === 'caregivers') loadCareGivers();
+          loadDashboard(); // Refresh counts
+        } else {
+          Swal.fire('ผิดพลาด', res.message, 'error');
+        }
+      } catch (err) {
+        hideLoading();
+        Swal.fire('ผิดพลาด', err.message, 'error');
+      }
+    };
+    reader.readAsText(file);
   });
 }
 
