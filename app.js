@@ -169,19 +169,28 @@ function navigate(page, params = {}) {
 
 function renderPage(page, params) {
   const app = document.getElementById('app');
+  let result;
   switch (page) {
     case 'login': app.innerHTML = renderLogin(); break;
     case 'setup': app.innerHTML = renderSetup(); break;
-    case 'dashboard': renderDashboard(app); break;
-    case 'patients': renderPatients(app); break;
-    case 'caregivers': renderCaregivers(app); break;
-    case 'visits': renderVisits(app, params); break;
+    case 'dashboard': result = renderDashboard(app); break;
+    case 'patients': result = renderPatients(app); break;
+    case 'caregivers': result = renderCaregivers(app); break;
+    case 'visits': result = renderVisits(app, params); break;
     case 'visit-form': renderVisitForm(app, params); break;
-    case 'reports': renderReports(app); break;
-    case 'settings': renderSettings(app); break;
-    case 'assignments': renderAssignments(app); break;
+    case 'reports': result = renderReports(app); break;
+    case 'settings': result = renderSettings(app); break;
+    case 'assignments': result = renderAssignments(app); break;
     case 'profile': app.innerHTML = renderProfile(); break;
     default: app.innerHTML = '<p class="p-8 text-gray-500">ไม่พบหน้านี้</p>';
+  }
+  // จับ error จาก async render — ป้องกัน loading ค้าง
+  if (result && typeof result.catch === 'function') {
+    result.catch(function(err) {
+      console.error('Render error:', page, err);
+      showLoading(false);
+      app.innerHTML = '<div class="p-8 text-center"><p class="text-red-500 font-bold mb-2">เกิดข้อผิดพลาด</p><p class="text-gray-500 text-sm">' + (err.message || err) + '</p><button onclick="navigate(\'dashboard\')" class="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg">กลับหน้าหลัก</button></div>';
+    });
   }
   window.scrollTo(0, 0);
 }
@@ -236,7 +245,7 @@ function renderSetup() {
       <div id="test-result" class="mt-3 text-sm"></div>
       <div class="mt-4 p-3 bg-yellow-50 rounded-lg text-xs text-gray-600">
         <p class="font-bold text-yellow-800 mb-1">ขั้นตอนก่อนใช้งาน:</p>
-        <p>1. เปิด Apps Script Editor → รันฟังก์ชัน <code>testSetup_</code> เพื่อ Authorize สิทธิ์</p>
+        <p>1. เปิด Apps Script Editor → รันฟังก์ชัน <code>testSetup</code> เพื่อ Authorize สิทธิ์</p>
         <p>2. Deploy → Web app → Execute as: <b>Me</b> → Who has access: <b>Anyone</b></p>
         <p>3. คัดลอก URL (ลงท้ายด้วย /exec) มาวางข้างบน</p>
       </div>
@@ -294,8 +303,10 @@ function saveSetup() {
 // ============================================================
 async function renderDashboard(app) {
   app.innerHTML = '<div class="flex items-center justify-center h-64"><div class="spinner"></div></div>';
-  const res = await api('getDashboardStats');
-  const d = res.success ? res.data : { totalPatients: 0, totalCareGivers: 0, totalVisitsThisMonth: 0, totalFollowUp: 0, casesToTrack: [], recentVisits: [] };
+  try {
+    const res = await api('getDashboardStats');
+    console.log('Dashboard data:', res);
+    const d = res.success ? res.data : { totalPatients: 0, totalCareGivers: 0, totalVisitsThisMonth: 0, totalFollowUp: 0, casesToTrack: [], recentVisits: [] };
 
   app.innerHTML = `
   <!-- Hero -->
@@ -394,6 +405,11 @@ async function renderDashboard(app) {
     </div>
   </div>`;
   lucide.createIcons();
+  } catch (err) {
+    console.error('renderDashboard error:', err);
+    showLoading(false);
+    app.innerHTML = '<div class="p-8 text-center"><p class="text-red-500 font-bold mb-2">โหลด Dashboard ไม่สำเร็จ</p><p class="text-gray-500 text-sm mb-4">' + (err.message || err) + '</p><button onclick="navigate(\'dashboard\')" class="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm">ลองใหม่</button></div>';
+  }
 }
 
 // ============================================================
