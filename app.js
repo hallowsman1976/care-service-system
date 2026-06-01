@@ -2,7 +2,7 @@
 // CONFIGURATION
 // ------------------
 // นำ URL ที่ได้จากการ Deploy Apps Script มาใส่ตรงนี้
-const API_URL = "YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL"; 
+const API_URL = "https://script.google.com/macros/s/AKfycbwAEJGrYFgQ2z3whJzkPleZUjqqeSnZP3iqt_NqqrunTPS3jRAz-9ZuHpkrlseSb9kC/exec"; 
 
 // ------------------
 // STATE MANAGEMENT
