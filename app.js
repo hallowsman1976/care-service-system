@@ -7,7 +7,7 @@
 // CONFIG — เปลี่ยน WEBAPP_URL ตรงนี้หลัง Deploy
 // ============================================================
 const CONFIG = {
-  WEBAPP_URL: localStorage.getItem('WEBAPP_URL') || '',
+  WEBAPP_URL: localStorage.getItem('https://script.google.com/macros/s/AKfycbwAEJGrYFgQ2z3whJzkPleZUjqqeSnZP3iqt_NqqrunTPS3jRAz-9ZuHpkrlseSb9kC/exec') || '',
   APP_NAME: 'ระบบดูแลผู้มีภาวะพึ่งพิง'
 };
 
