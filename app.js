@@ -41,16 +41,30 @@ async function api(action, data = {}) {
     return { success: false, message: 'ยังไม่ได้ตั้งค่า WEBAPP_URL' };
   }
   showLoading(true);
+  console.log('→ API', action, data);
+  const t0 = Date.now();
   try {
+    // Timeout 60s (GAS cold start อาจช้า 10-30 วินาที)
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+
     const res = await fetch(CONFIG.WEBAPP_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify({ action, data, token: state.token }),
-      redirect: 'follow'
+      redirect: 'follow',
+      signal: controller.signal
     });
+    clearTimeout(timeout);
+
     const text = await res.text();
-    if (!text || text.trim().startsWith('<')) {
-      throw new Error('Server ตอบกลับ HTML แทน JSON — ตรวจ Deploy settings');
+    console.log('← API', action, (Date.now() - t0) + 'ms', text.substring(0, 200));
+
+    if (!text || text.trim() === '') {
+      throw new Error('Server ตอบกลับว่างเปล่า — ตรวจ Deploy URL');
+    }
+    if (text.trim().startsWith('<')) {
+      throw new Error('Server ตอบกลับ HTML แทน JSON — ตรวจ Deploy settings:\n1) Execute as: Me\n2) Who has access: Anyone\n3) ต้อง Authorize script ก่อน Deploy');
     }
     const result = JSON.parse(text);
     if (!result.success && result.message && result.message.includes('Session หมดอายุ')) {
@@ -59,8 +73,20 @@ async function api(action, data = {}) {
     }
     return result;
   } catch (err) {
-    console.error('API Error:', action, err);
-    return { success: false, message: 'เชื่อมต่อ server ไม่สำเร็จ: ' + err.message };
+    console.error('✗ API', action, (Date.now() - t0) + 'ms', err);
+    let msg = err.message || 'เกิดข้อผิดพลาด';
+    if (err.name === 'AbortError') {
+      msg = 'หมดเวลารอ (60 วินาที) — GAS อาจยังไม่พร้อม กรุณาลองใหม่';
+    } else if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('Load failed')) {
+      msg = 'เชื่อมต่อ server ไม่ได้ — ตรวจสอบ:\n1) WEBAPP_URL ถูกต้อง (ลงท้ายด้วย /exec)\n2) อินเทอร์เน็ตเชื่อมต่ออยู่\n3) Script ถูก Deploy แล้ว';
+    }
+    Swal.fire({
+      icon: 'error',
+      title: 'เชื่อมต่อไม่สำเร็จ',
+      text: msg,
+      confirmButtonText: 'ตกลง'
+    });
+    return { success: false, message: msg };
   } finally {
     showLoading(false);
   }
@@ -76,7 +102,9 @@ async function login() {
     Swal.fire('', 'กรุณากรอก username และ password', 'warning');
     return;
   }
+  console.log('Login attempt:', username);
   const res = await api('login', { username, password });
+  console.log('Login result:', res);
   if (res.success) {
     state.token = res.data.token;
     state.user = res.data;
@@ -85,7 +113,10 @@ async function login() {
     Swal.fire({ icon: 'success', title: 'เข้าสู่ระบบสำเร็จ', text: 'ยินดีต้อนรับ ' + res.data.fullName, timer: 1500, showConfirmButton: false });
     setTimeout(() => navigate('dashboard'), 1000);
   } else {
-    Swal.fire('เข้าสู่ระบบไม่สำเร็จ', res.message, 'error');
+    // api() already shows Swal for connection errors, only show login-specific errors
+    if (!res.message.includes('เชื่อมต่อ') && !res.message.includes('Failed to fetch')) {
+      Swal.fire('เข้าสู่ระบบไม่สำเร็จ', res.message, 'error');
+    }
   }
 }
 
@@ -199,10 +230,54 @@ function renderSetup() {
       </div>
       <div class="flex gap-2">
         <button onclick="saveSetup()" class="flex-1 py-2.5 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition">บันทึก</button>
+        <button onclick="testConnection()" class="px-4 py-2.5 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition">ทดสอบ</button>
         <button onclick="navigate('login')" class="px-4 py-2.5 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition">กลับ</button>
+      </div>
+      <div id="test-result" class="mt-3 text-sm"></div>
+      <div class="mt-4 p-3 bg-yellow-50 rounded-lg text-xs text-gray-600">
+        <p class="font-bold text-yellow-800 mb-1">ขั้นตอนก่อนใช้งาน:</p>
+        <p>1. เปิด Apps Script Editor → รันฟังก์ชัน <code>testSetup_</code> เพื่อ Authorize สิทธิ์</p>
+        <p>2. Deploy → Web app → Execute as: <b>Me</b> → Who has access: <b>Anyone</b></p>
+        <p>3. คัดลอก URL (ลงท้ายด้วย /exec) มาวางข้างบน</p>
       </div>
     </div>
   </div>`;
+}
+
+async function testConnection() {
+  const url = document.getElementById('setup-url').value.trim();
+  const el = document.getElementById('test-result');
+  if (!url) { el.innerHTML = '<span class="text-red-500">กรุณากรอก URL</span>'; return; }
+  el.innerHTML = '<span class="text-blue-500">กำลังทดสอบ... (อาจใช้เวลา 10-30 วินาที)</span>';
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+    const res = await fetch(url, { redirect: 'follow', signal: controller.signal });
+    clearTimeout(timeout);
+    const text = await res.text();
+    console.log('Test response:', text.substring(0, 500));
+    if (text.trim().startsWith('<')) {
+      el.innerHTML = '<span class="text-red-500">❌ ได้ HTML กลับมา — ตรวจ Deploy settings (Execute as: Me, Anyone) และต้อง Authorize script ก่อน</span>';
+    } else {
+      try {
+        const json = JSON.parse(text);
+        if (json.success) {
+          el.innerHTML = '<span class="text-green-600">✅ เชื่อมต่อสำเร็จ! ' + (json.message || '') + '</span>';
+        } else {
+          el.innerHTML = '<span class="text-yellow-600">⚠️ เชื่อมต่อได้ แต่มีปัญหา: ' + (json.message || 'unknown') + '</span>';
+        }
+      } catch (e) {
+        el.innerHTML = '<span class="text-red-500">❌ ข้อมูลที่ได้กลับมาไม่ใช่ JSON: ' + text.substring(0, 100) + '</span>';
+      }
+    }
+  } catch (err) {
+    console.error('Test failed:', err);
+    if (err.name === 'AbortError') {
+      el.innerHTML = '<span class="text-red-500">❌ หมดเวลา (60 วินาที)</span>';
+    } else {
+      el.innerHTML = '<span class="text-red-500">❌ เชื่อมต่อไม่ได้: ' + err.message + '</span>';
+    }
+  }
 }
 
 function saveSetup() {
@@ -1332,7 +1407,19 @@ async function showImportModal() {
 function showLoading(show) {
   state.loading = show;
   const el = document.getElementById('loading-overlay');
-  if (el) el.style.display = show ? 'flex' : 'none';
+  if (el) {
+    el.style.display = show ? 'flex' : 'none';
+  }
+  // Failsafe: force hide after 65 seconds
+  if (show) {
+    clearTimeout(window._loadingTimeout);
+    window._loadingTimeout = setTimeout(() => {
+      showLoading(false);
+      console.warn('Loading timeout — force hidden');
+    }, 65000);
+  } else {
+    clearTimeout(window._loadingTimeout);
+  }
 }
 
 function esc(str) {
