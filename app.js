@@ -2,7 +2,7 @@
 // CONFIGURATION
 // ------------------
 // นำ URL ที่ได้จากการ Deploy Apps Script มาใส่ตรงนี้
-const API_URL = "https://script.google.com/macros/s/AKfycbwAEJGrYFgQ2z3whJzkPleZUjqqeSnZP3iqt_NqqrunTPS3jRAz-9ZuHpkrlseSb9kC/exec"; 
+const API_URL = "YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL"; 
 
 // ------------------
 // STATE MANAGEMENT
@@ -61,6 +61,55 @@ function navigateTo(view) {
     state.currentView = view;
     renderDataForView(view);
   }
+}
+
+function initFlatpickrThai(selector, defaultDate = null) {
+  return flatpickr(selector, {
+    dateFormat: "d/m/Y",
+    locale: "th",
+    defaultDate: defaultDate,
+    onReady: function(selectedDates, dateStr, instance) {
+      const yearInput = instance.currentYearElement;
+      if (yearInput) {
+        yearInput.type = "text";
+        yearInput.value = instance.currentYear + 543;
+        
+        yearInput.addEventListener('input', function(e) {
+          const val = parseInt(e.target.value);
+          if (val >= 2400 && val <= 2700) {
+            instance.changeYear(val - 543);
+          }
+        });
+      }
+    },
+    onYearChange: function(selectedDates, dateStr, instance) {
+      if (instance.currentYearElement) {
+        instance.currentYearElement.value = instance.currentYear + 543;
+      }
+    },
+    onMonthChange: function(selectedDates, dateStr, instance) {
+      if (instance.currentYearElement) {
+        instance.currentYearElement.value = instance.currentYear + 543;
+      }
+    },
+    formatDate: (date, format, locale) => {
+      const d = date.getDate().toString().padStart(2, '0');
+      const m = (date.getMonth() + 1).toString().padStart(2, '0');
+      const y = date.getFullYear() + 543;
+      return `${d}/${m}/${y}`;
+    },
+    parseDate: (datestr, format) => {
+      if (!datestr) return null;
+      const parts = datestr.split('/');
+      if (parts.length === 3) {
+         const d = parseInt(parts[0], 10);
+         const m = parseInt(parts[1], 10) - 1;
+         const y = parseInt(parts[2], 10) - 543;
+         return new Date(y, m, d);
+      }
+      return new Date();
+    }
+  });
 }
 
 // ------------------
@@ -136,10 +185,7 @@ function attachEventListeners() {
   });
 
   // Init Flatpickr for Patient Birthdate
-  flatpickr("#p-birth", {
-    dateFormat: "d/m/Y",
-    locale: "th"
-  });
+  initFlatpickrThai("#p-birth");
 
   // Add Patient Form
   document.getElementById('add-patient-form')?.addEventListener('submit', async (e) => {
@@ -285,6 +331,33 @@ function attachEventListeners() {
       }
     };
     reader.readAsText(file);
+  });
+
+  // Download CSV Template
+  document.getElementById('btn-download-template')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    const importType = document.getElementById('import-type').value;
+    let csvContent = "";
+    let filename = "";
+
+    if (importType === 'patients') {
+      csvContent = "PID,name,birthdateBE,gender,address,moo,caregiverName,phone\n1234567890123,สมชาย ใจดี,01/01/2500,ชาย,123/45,1,สมศรี ใจดี,0812345678";
+      filename = "template_patients.csv";
+    } else {
+      csvContent = "username,password,name,PID,address,moo,phone\ncg01,123456,นางสมปอง ดูแลดี,3210987654321,99/9,2,0899999999";
+      filename = "template_caregivers.csv";
+    }
+
+    const bom = "\uFEFF"; // Add BOM for Excel UTF-8 support
+    const blob = new Blob([bom + csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    link.setAttribute("href", url);
+    link.setAttribute("download", filename);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
   });
 }
 
@@ -439,11 +512,7 @@ window.startVisit = (patient_id) => {
   document.getElementById('vf-patient-name').textContent = p.name;
   
   // Set default visit date
-  flatpickr("#vf-date", {
-    dateFormat: "d/m/Y",
-    defaultDate: new Date(),
-    locale: "th" // Requires flatpickr th locale included in HTML
-  });
+  initFlatpickrThai("#vf-date", new Date());
   
   // Mental Health Calculate Listeners
   setupMentalHealthCalculations();
