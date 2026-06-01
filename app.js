@@ -30,9 +30,9 @@ async function apiGet(action, params = {}) {
 }
 
 async function apiPost(action, payload = {}) {
+  // ใช้วิธีส่งผ่านตัวแปร POST แบบข้อความ เพื่อหลีกเลี่ยง CORS Preflight Error
   const response = await fetch(API_URL, {
     method: 'POST',
-    mode: 'cors',
     body: JSON.stringify({ action: action, payload: payload })
   });
   return await response.json();
