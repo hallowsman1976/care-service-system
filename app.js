@@ -2,7 +2,7 @@
 // CONFIGURATION
 // ------------------
 // นำ URL ที่ได้จากการ Deploy Apps Script มาใส่ตรงนี้
-const API_URL = "https://script.google.com/macros/s/AKfycbwAEJGrYFgQ2z3whJzkPleZUjqqeSnZP3iqt_NqqrunTPS3jRAz-9ZuHpkrlseSb9kC/exec"; 
+const API_URL = "YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL"; 
 
 // ------------------
 // STATE MANAGEMENT
@@ -30,9 +30,9 @@ async function apiGet(action, params = {}) {
 }
 
 async function apiPost(action, payload = {}) {
-  // ใช้วิธีส่งผ่านตัวแปร POST แบบข้อความ เพื่อหลีกเลี่ยง CORS Preflight Error
   const response = await fetch(API_URL, {
     method: 'POST',
+    mode: 'cors',
     body: JSON.stringify({ action: action, payload: payload })
   });
   return await response.json();
@@ -134,6 +134,76 @@ function attachEventListeners() {
   document.getElementById('mobile-menu-btn')?.addEventListener('click', () => {
     document.getElementById('sidebar')?.classList.toggle('open');
   });
+
+  // Add Patient Form
+  document.getElementById('add-patient-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const data = {
+      PID: document.getElementById('p-pid').value,
+      name: document.getElementById('p-name').value,
+      birthdateBE: document.getElementById('p-birth').value,
+      gender: document.getElementById('p-gender').value,
+      address: document.getElementById('p-address').value,
+      moo: document.getElementById('p-moo').value,
+      caregiverName: document.getElementById('p-cgname').value,
+      phone: document.getElementById('p-phone').value
+    };
+    showLoading();
+    const res = await apiPost('createPatient', data);
+    hideLoading();
+    if(res.success) {
+      Swal.fire('สำเร็จ', 'เพิ่มผู้ป่วยเรียบร้อย', 'success');
+      document.getElementById('patient-modal').classList.add('hidden');
+      document.getElementById('add-patient-form').reset();
+      loadPatients();
+    } else {
+      Swal.fire('ผิดพลาด', res.message, 'error');
+    }
+  });
+
+  // Add CG Form
+  document.getElementById('add-cg-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const data = {
+      username: document.getElementById('c-username').value,
+      password: document.getElementById('c-password').value,
+      name: document.getElementById('c-name').value,
+      PID: document.getElementById('c-pid').value,
+      address: document.getElementById('c-address').value,
+      moo: document.getElementById('c-moo').value,
+      phone: document.getElementById('c-phone').value
+    };
+    showLoading();
+    const res = await apiPost('createCG', data);
+    hideLoading();
+    if(res.success) {
+      Swal.fire('สำเร็จ', 'เพิ่ม Care Giver เรียบร้อย', 'success');
+      document.getElementById('cg-modal').classList.add('hidden');
+      document.getElementById('add-cg-form').reset();
+      loadCareGivers();
+    } else {
+      Swal.fire('ผิดพลาด', res.message, 'error');
+    }
+  });
+
+  // Save Settings
+  document.getElementById('settings-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const inputs = document.querySelectorAll('#settings-container input');
+    const payload = Array.from(inputs).map(input => ({
+      Key: input.name,
+      Value: input.value
+    }));
+    
+    showLoading();
+    const res = await apiPost('saveSettings', payload);
+    hideLoading();
+    if (res.success) {
+      Swal.fire('สำเร็จ', 'บันทึกการตั้งค่าแล้ว', 'success');
+    } else {
+      Swal.fire('ผิดพลาด', res.message, 'error');
+    }
+  });
 }
 
 function setupAppForUser() {
@@ -160,7 +230,9 @@ function setupAppForUser() {
 async function renderDataForView(view) {
   if (view === 'dashboard') await loadDashboard();
   if (view === 'patients') await loadPatients();
-  // TODO: Add other views (visits, settings, etc.) based on requirements.
+  if (view === 'caregivers') await loadCareGivers();
+  if (view === 'settings') await loadSettings();
+  lucide.createIcons();
 }
 
 async function loadDashboard() {
@@ -223,6 +295,52 @@ async function loadPatients() {
       }
     }
   } catch(err) {
+    hideLoading();
+    console.error(err);
+  }
+}
+
+async function loadCareGivers() {
+  showLoading();
+  try {
+    const res = await apiGet('listCG');
+    hideLoading();
+    if (res.success) {
+      state.caregivers = res.data;
+      const container = document.getElementById('cg-list');
+      if (container) {
+        container.innerHTML = state.caregivers.map(c => `
+          <div class="glass-card p-4">
+            <h3 class="font-bold text-lg">${c.name}</h3>
+            <p class="text-sm text-gray-600">Username: ${c.username} | โทร: ${c.phone}</p>
+          </div>
+        `).join('');
+      }
+    }
+  } catch (err) {
+    hideLoading();
+    console.error(err);
+  }
+}
+
+async function loadSettings() {
+  showLoading();
+  try {
+    const res = await apiGet('getSettings');
+    hideLoading();
+    if (res.success) {
+      state.settings = res.data;
+      const container = document.getElementById('settings-container');
+      if (container) {
+        container.innerHTML = state.settings.map(s => `
+          <div>
+            <label class="block text-sm font-medium mb-1">${s.Key} <span class="text-xs text-gray-400">(${s.Detail})</span></label>
+            <input type="text" name="${s.Key}" value="${s.Value || ''}" class="w-full border p-2 rounded">
+          </div>
+        `).join('');
+      }
+    }
+  } catch (err) {
     hideLoading();
     console.error(err);
   }

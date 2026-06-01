@@ -159,7 +159,7 @@
                 <section id="view-patients" class="view-section hidden">
                     <div class="flex justify-between items-center mb-6">
                         <h2 class="text-2xl font-bold">ผู้มีภาวะพึ่งพิง</h2>
-                        <button class="admin-only btn-primary px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium">
+                        <button onclick="document.getElementById('patient-modal').classList.remove('hidden')" class="admin-only btn-primary px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium">
                             <i data-lucide="plus" class="w-4 h-4"></i> เพิ่มใหม่
                         </button>
                     </div>
@@ -246,7 +246,86 @@
                     </div>
                 </section>
 
-                <!-- More Views: caregivers, reports, settings (Left as placeholders for full implementation) -->
+                <!-- Care Givers View -->
+                <section id="view-caregivers" class="view-section hidden admin-only">
+                    <div class="flex justify-between items-center mb-6">
+                        <h2 class="text-2xl font-bold">ข้อมูล Care Giver</h2>
+                        <button onclick="document.getElementById('cg-modal').classList.remove('hidden')" class="btn-primary px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium">
+                            <i data-lucide="plus" class="w-4 h-4"></i> เพิ่มใหม่
+                        </button>
+                    </div>
+                    <div id="cg-list" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <!-- Injected from JS -->
+                    </div>
+                </section>
+
+                <!-- Reports View -->
+                <section id="view-reports" class="view-section hidden">
+                    <h2 class="text-2xl font-bold mb-6">รายงานการเยี่ยม</h2>
+                    <div class="glass-card p-6 rounded-2xl">
+                        <p class="text-gray-500">ระบบรายงานกำลังอยู่ระหว่างการพัฒนา...</p>
+                    </div>
+                </section>
+
+                <!-- Settings View -->
+                <section id="view-settings" class="view-section hidden admin-only">
+                    <h2 class="text-2xl font-bold mb-6">ตั้งค่าระบบ</h2>
+                    <div class="glass-card p-6 rounded-2xl">
+                        <form id="settings-form" class="space-y-4">
+                            <div id="settings-container">
+                                <!-- Injected from JS -->
+                            </div>
+                            <button type="submit" class="btn-primary px-4 py-2 rounded-lg font-medium">บันทึกการตั้งค่า</button>
+                        </form>
+                    </div>
+                </section>
+
+                <!-- Patient Modal -->
+                <div id="patient-modal" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+                    <div class="bg-white rounded-2xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-xl font-bold">เพิ่มผู้ป่วยใหม่</h3>
+                            <button onclick="document.getElementById('patient-modal').classList.add('hidden')"><i data-lucide="x"></i></button>
+                        </div>
+                        <form id="add-patient-form" class="space-y-4">
+                            <div><label class="block text-sm">เลขบัตร ปชช. (13 หลัก)</label><input type="text" id="p-pid" class="w-full border p-2 rounded" required></div>
+                            <div><label class="block text-sm">ชื่อ-นามสกุล</label><input type="text" id="p-name" class="w-full border p-2 rounded" required></div>
+                            <div><label class="block text-sm">วันเกิด (พ.ศ. dd/mm/yyyy)</label><input type="text" id="p-birth" class="w-full border p-2 rounded" required></div>
+                            <div>
+                                <label class="block text-sm">เพศ</label>
+                                <select id="p-gender" class="w-full border p-2 rounded">
+                                    <option value="ชาย">ชาย</option>
+                                    <option value="หญิง">หญิง</option>
+                                </select>
+                            </div>
+                            <div><label class="block text-sm">ที่อยู่ (บ้านเลขที่)</label><input type="text" id="p-address" class="w-full border p-2 rounded"></div>
+                            <div><label class="block text-sm">หมู่ที่</label><input type="text" id="p-moo" class="w-full border p-2 rounded"></div>
+                            <div><label class="block text-sm">ชื่อผู้ดูแลหลัก (ญาติ)</label><input type="text" id="p-cgname" class="w-full border p-2 rounded"></div>
+                            <div><label class="block text-sm">เบอร์โทรศัพท์</label><input type="text" id="p-phone" class="w-full border p-2 rounded"></div>
+                            <button type="submit" class="w-full btn-primary py-2 rounded-lg">บันทึกข้อมูล</button>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Care Giver Modal -->
+                <div id="cg-modal" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+                    <div class="bg-white rounded-2xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-xl font-bold">เพิ่ม Care Giver</h3>
+                            <button onclick="document.getElementById('cg-modal').classList.add('hidden')"><i data-lucide="x"></i></button>
+                        </div>
+                        <form id="add-cg-form" class="space-y-4">
+                            <div><label class="block text-sm">Username สำหรับเข้าระบบ</label><input type="text" id="c-username" class="w-full border p-2 rounded" required></div>
+                            <div><label class="block text-sm">รหัสผ่าน</label><input type="password" id="c-password" class="w-full border p-2 rounded" required></div>
+                            <div><label class="block text-sm">ชื่อ-นามสกุล</label><input type="text" id="c-name" class="w-full border p-2 rounded" required></div>
+                            <div><label class="block text-sm">เลขบัตร ปชช.</label><input type="text" id="c-pid" class="w-full border p-2 rounded" required></div>
+                            <div><label class="block text-sm">ที่อยู่</label><input type="text" id="c-address" class="w-full border p-2 rounded"></div>
+                            <div><label class="block text-sm">หมู่ที่</label><input type="text" id="c-moo" class="w-full border p-2 rounded"></div>
+                            <div><label class="block text-sm">เบอร์โทรศัพท์</label><input type="text" id="c-phone" class="w-full border p-2 rounded"></div>
+                            <button type="submit" class="w-full btn-primary py-2 rounded-lg">บันทึกข้อมูล</button>
+                        </form>
+                    </div>
+                </div>
 
             </div>
         </main>
