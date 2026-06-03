@@ -617,6 +617,118 @@ function Toggle({ value, onChange, label, sub }) {
   );
 }
 
+// ─────────────────────────────────── Thai (Buddhist-era) flat date picker
+const THAI_MONTHS = ["มกราคม","กุมภาพันธ์","มีนาคม","เมษายน","พฤษภาคม","มิถุนายน","กรกฎาคม","สิงหาคม","กันยายน","ตุลาคม","พฤศจิกายน","ธันวาคม"];
+const THAI_DOW = ["อา","จ","อ","พ","พฤ","ศ","ส"];
+
+// 2-digit (or n-digit) zero pad
+function padN(n, w = 2) { return String(n).padStart(w, "0"); }
+
+// Parse a Buddhist-era date string ("2487-09-09" or "2487-09-09T...") →
+// { beYear, month(0-11), day } or null. Tolerates CE-year strings.
+function parseBE(s) {
+  if (!s) return null;
+  const m = String(s).match(/^(\d{1,4})-(\d{1,2})-(\d{1,2})/);
+  if (!m) return null;
+  let y = +m[1];
+  if (y < 2400) y += 543;            // a CE-year slipped in → convert to BE
+  return { beYear: y, month: (+m[2]) - 1, day: +m[3] };
+}
+
+// Emit the backend's birthdateBE format: BE year + UTC midnight.
+function toBEISO(beYear, month, day) {
+  return padN(beYear, 4) + "-" + padN(month + 1) + "-" + padN(day) + "T00:00:00.000Z";
+}
+
+// Age (in years) from a BE-year birthdate string, or "" if unknown.
+function ageFromBE(s) {
+  const p = parseBE(s);
+  if (!p) return "";
+  const nowBE = new Date().getFullYear() + 543;
+  const a = nowBE - p.beYear;
+  return (a >= 0 && a < 130) ? a : "";
+}
+
+function ThaiDatePicker({ value, onChange, placeholder = "เลือกวันเกิด" }) {
+  const sel = parseBE(value);
+  const nowBE = new Date().getFullYear() + 543;
+  const [open, setOpen] = useState(false);
+  const [viewY, setViewY] = useState(sel ? sel.beYear : nowBE - 70);
+  const [viewM, setViewM] = useState(sel ? sel.month : 0);
+
+  // Re-sync the calendar view when an external value arrives.
+  useEffect(() => {
+    const s = parseBE(value);
+    if (s) { setViewY(s.beYear); setViewM(s.month); }
+  }, [value]);
+
+  // Calendar math uses the Gregorian year so leap days / weekdays are correct.
+  const gy = viewY - 543;
+  const daysInMonth = new Date(gy, viewM + 1, 0).getDate();
+  const firstDow = new Date(gy, viewM, 1).getDay();
+  const cells = [];
+  for (let i = 0; i < firstDow; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+
+  const years = [];
+  for (let y = nowBE; y >= nowBE - 120; y--) years.push(y);
+
+  const prevMonth = () => { if (viewM === 0) { setViewM(11); setViewY(viewY - 1); } else setViewM(viewM - 1); };
+  const nextMonth = () => { if (viewM === 11) { setViewM(0); setViewY(viewY + 1); } else setViewM(viewM + 1); };
+  const pick = (d) => { onChange(toBEISO(viewY, viewM, d)); setOpen(false); };
+
+  const label = sel ? `${sel.day} ${THAI_MONTHS[sel.month]} ${sel.beYear}` : "";
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="w-full h-12 px-4 rounded-xl bg-white border border-ink-200 text-left text-[15px] flex items-center justify-between outline-none focus:border-ink-700 focus:shadow-ring transition"
+      >
+        <span className={label ? "text-ink-900 tnum" : "text-ink-400"}>{label || placeholder}</span>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="text-ink-500"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+      </button>
+
+      {open ? (
+        <div className="mt-2 rounded-2xl bg-white border border-ink-200 shadow-card p-3">
+          <div className="flex items-center gap-2 mb-2">
+            <button type="button" onClick={prevMonth} className="w-8 h-8 grid place-items-center rounded-lg bg-ink-50 text-ink-700 active:scale-95">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 18l-6-6 6-6"/></svg>
+            </button>
+            <select value={viewM} onChange={e => setViewM(+e.target.value)} className="flex-1 h-9 px-2 rounded-lg border border-ink-200 text-[13px] bg-white outline-none focus:border-ink-700">
+              {THAI_MONTHS.map((m, i) => <option key={i} value={i}>{m}</option>)}
+            </select>
+            <select value={viewY} onChange={e => setViewY(+e.target.value)} className="w-[88px] h-9 px-2 rounded-lg border border-ink-200 text-[13px] bg-white outline-none focus:border-ink-700 tnum">
+              {years.map(y => <option key={y} value={y}>{y}</option>)}
+            </select>
+            <button type="button" onClick={nextMonth} className="w-8 h-8 grid place-items-center rounded-lg bg-ink-50 text-ink-700 active:scale-95">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 6l6 6-6 6"/></svg>
+            </button>
+          </div>
+          <div className="grid grid-cols-7 gap-1 mb-1">
+            {THAI_DOW.map((d, i) => <div key={i} className="text-center text-[11px] text-ink-400">{d}</div>)}
+          </div>
+          <div className="grid grid-cols-7 gap-1">
+            {cells.map((d, i) => {
+              if (!d) return <div key={i}></div>;
+              const on = sel && sel.beYear === viewY && sel.month === viewM && sel.day === d;
+              return (
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => pick(d)}
+                  className={"h-9 rounded-lg text-[13px] tnum transition " + (on ? "bg-ink-800 text-white" : "text-ink-800 hover:bg-ink-50 active:bg-ink-100")}
+                >{d}</button>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 // ──────────────────────────────────────────────────────────────── Radio Card (style 1 — outlined card with score)
 function RadioCardGroup({ items, value, onChange, columns }) {
   return (
@@ -2366,9 +2478,12 @@ function PatientEditor({ patient, onSave, onDelete, onClose }) {
       <Field label="ชื่อ - นามสกุล" required>
         <TextInput value={d.name} onChange={e => set({ name: e.target.value })} placeholder="เช่น นางบุญมี  สุขสมบัติ"/>
       </Field>
+      <Field label="วันเดือนปีเกิด (พ.ศ.)" hint="เลือกจากปฏิทิน">
+        <ThaiDatePicker value={d.birthdateBE} onChange={iso => set({ birthdateBE: iso })}/>
+      </Field>
       <div className="grid grid-cols-2 gap-3">
-        <Field label="อายุ" required>
-          <TextInput value={d.age} onChange={e => set({ age: e.target.value.replace(/[^\d]/g,"") })} inputMode="numeric" suffix="ปี"/>
+        <Field label="อายุ" hint="คำนวณจากวันเกิด">
+          <TextInput value={ageFromBE(d.birthdateBE)} readOnly inputMode="numeric" suffix="ปี" placeholder="—"/>
         </Field>
         <Field label="เพศ">
           <Select
