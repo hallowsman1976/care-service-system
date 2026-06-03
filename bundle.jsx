@@ -77,11 +77,18 @@ const LTC_API = (() => {
     const body = { fn, args: args || [] };
     const tok = (opts && "token" in opts) ? opts.token : getToken();
     if (tok) body.token = tok;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify(body)
-    });
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify(body)
+      });
+    } catch (e) {
+      // "Failed to fetch" / CORS block → the request never reached the backend.
+      // Almost always the Web App isn't deployed as public (Who has access ≠ Anyone).
+      throw new Error("เชื่อมต่อระบบหลังบ้านไม่ได้ — ตรวจสอบการ Deploy ของ Apps Script (ตั้งสิทธิ์ \"ใครก็ได้ / Anyone\") หรือการเชื่อมต่ออินเทอร์เน็ต");
+    }
     const data = await parseJson_(res);
     if (!data || data.ok === false) {
       const msg = (data && data.message) || "การเชื่อมต่อระบบหลังบ้านล้มเหลว";
@@ -260,7 +267,12 @@ const LTC_API = (() => {
   async function ping() {
     const url = getBaseUrl();
     if (!url) throw new Error("ยังไม่ได้ตั้งค่า URL");
-    const res = await fetch(url, { method: "GET" });
+    let res;
+    try {
+      res = await fetch(url, { method: "GET" });
+    } catch (e) {
+      throw new Error("เชื่อมต่อระบบหลังบ้านไม่ได้ — ตรวจสอบการ Deploy ของ Apps Script (ตั้งสิทธิ์ \"ใครก็ได้ / Anyone\") หรือการเชื่อมต่ออินเทอร์เน็ต");
+    }
     const data = await parseJson_(res);
     if (!data || data.ok === false) throw new Error((data && data.message) || "ตอบกลับไม่ถูกต้อง");
     return { ok: true, service: data.service || "LTC Dependence", version: data.version || "live", message: "pong" };
