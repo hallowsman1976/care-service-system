@@ -35,12 +35,17 @@
    ╚═══════════════════════════════════════════════════════════════════════╝ */
 
 const LTC_API = (() => {
-  const LS_URL  = "ltc_api_url";
-  const LS_USER = "ltc_user";
+  const LS_URL   = "ltc_api_url";
+  const LS_USER  = "ltc_user";
+  const LS_TOKEN = "ltc_token";
 
   // Deployed Google Apps Script Web App — the system is LIVE by default.
-  // Contract:  reads  = GET  ?action=<name>          → { success, data, message }
-  //            writes = POST { action, payload }      → { success, data, message }
+  // Contract (matches database/*.gs):
+  //   • doGet  → health check only  { ok, service, version, time }
+  //   • doPost → RPC router. Body = { fn, args, token } sent as text/plain
+  //              (no CORS preflight). Each fn returns its own { ok, ... } object.
+  //   • Public fn: login. All others require a session token from login(),
+  //              and the server injects the resolved caller as the 1st arg.
   const DEFAULT_URL = "https://script.google.com/macros/s/AKfycbwAEJGrYFgQ2z3whJzkPleZUjqqeSnZP3iqt_NqqrunTPS3jRAz-9ZuHpkrlseSb9kC/exec";
 
   const ls = {
