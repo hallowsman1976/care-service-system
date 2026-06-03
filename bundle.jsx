@@ -23,6 +23,130 @@
 
 
 /* ╔═══════════════════════════════════════════════════════════════════════╗
+   ║  SECTION 0 · api.jsx                                                  ║
+   ║  Backend RPC client for the Google Apps Script Web App.               ║
+   ║  • Live mode  : POST {fn,args,token} as text/plain (no CORS preflight)║
+   ║                 to the configured Web App URL; returns Result<T>      ║
+   ║  • Mock mode  : when no URL is configured, resolves with the in-file  ║
+   ║                 mock data so the prototype runs fully offline.        ║
+   ║  Configure the URL at runtime via the Admin → ตั้งค่าระบบ screen, or   ║
+   ║  window.LTC_API_URL, or localStorage key "ltc_api_url".               ║
+   ║  Exposes: LTC_API                                                     ║
+   ╚═══════════════════════════════════════════════════════════════════════╝ */
+
+const LTC_API = (() => {
+  const LS_URL   = "ltc_api_url";
+  const LS_TOKEN = "ltc_session_token";
+
+  const ls = {
+    get(k) { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } },
+    set(k, v) { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch (e) {} }
+  };
+
+  const getBaseUrl = () => ((typeof window !== "undefined" && window.LTC_API_URL) || ls.get(LS_URL) || "").trim();
+  const setBaseUrl = (url) => ls.set(LS_URL, (url || "").trim());
+  const getToken   = () => ls.get(LS_TOKEN);
+  const setToken   = (t) => ls.set(LS_TOKEN, t);
+  const isLive     = () => !!getBaseUrl();
+  const delay      = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // Low-level RPC. text/plain avoids the CORS preflight that GAS can't answer.
+  async function rpc(fn, args, opts) {
+    const url = getBaseUrl();
+    if (!url) throw new Error("ยังไม่ได้ตั้งค่า URL ของระบบหลังบ้าน");
+    const token = opts && "token" in opts ? opts.token : getToken();
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ fn, args: args || [], token })
+    });
+    let data;
+    try { data = await res.json(); }
+    catch (e) { throw new Error("ระบบหลังบ้านตอบกลับไม่ถูกต้อง (ไม่ใช่ JSON)"); }
+    if (!data || data.ok === false) {
+      throw new Error((data && data.message) || "เกิดข้อผิดพลาดจากระบบหลังบ้าน");
+    }
+    return data;
+  }
+
+  // Map a server Patients row (sanitize_ of the sheet) into the frontend shape.
+  function normalizePatient(r) {
+    const CENTER = [16.5418, 104.7237];
+    let distance_km = null;
+    if (r.Lat && r.Lng) {
+      const dLat = (r.Lat - CENTER[0]) * 111;
+      const dLng = (r.Lng - CENTER[1]) * 111 * Math.cos(CENTER[0] * Math.PI / 180);
+      distance_km = Math.round(Math.sqrt(dLat * dLat + dLng * dLng) * 10) / 10;
+    }
+    return {
+      pid: String(r.PID), name: r.FullName, age: r.Age, sex: r.Sex,
+      village: r.VillageName || r.VillageID || "",
+      address: r.Address, caregiver_at_home: r.HouseholdCaregiverName,
+      relation: r.HouseholdRelationID, contact: r.HouseholdContact,
+      adl_group: r.ADLGroup, risk: r.RiskLevel,
+      last_visit: r.LastVisitDate || "—", visit_count: r.VisitCount || 0,
+      assigned_cg: r.AssignedCaregiverUserID,
+      distance_km,
+      // due/visited scheduling is not yet exposed by the backend
+      due_today: false, visited_today: false,
+      lat: r.Lat, lng: r.Lng
+    };
+  }
+
+  // ── High-level calls: live → RPC, offline → mock ──────────────────────────
+  async function login(username, password, role) {
+    if (isLive()) {
+      const r = await rpc("login", [username, password, (typeof navigator !== "undefined" ? navigator.userAgent : "web")], { token: "" });
+      setToken(r.token);
+      return { ok: true, token: r.token, user: r.user, role: (r.user && r.user.Role) || role };
+    }
+    await delay(500);
+    return { ok: true, token: "mock-token", user: { ...CURRENT_USER }, role, mock: true };
+  }
+
+  async function listPatients(opts) {
+    if (isLive()) {
+      const r = await rpc("listPatients", [opts || {}]);
+      return (r.patients || []).map(normalizePatient);
+    }
+    await delay(150);
+    return PATIENTS;
+  }
+
+  async function assignCaregiver(pid, caregiverUserId) {
+    if (isLive()) return await rpc("assignCaregiver", [pid, caregiverUserId]);
+    await delay(250);
+    return { ok: true, message: "มอบหมาย Care Giver สำเร็จ (โหมดตัวอย่าง)", mock: true };
+  }
+
+  async function submitVisit(payload) {
+    if (isLive()) return await rpc("submitVisit", [payload]);
+    await delay(900);
+    return { ok: true, mock: true };
+  }
+
+  // Connectivity check — uses doGet health endpoint.
+  async function ping() {
+    const url = getBaseUrl();
+    if (!url) throw new Error("ยังไม่ได้ตั้งค่า URL");
+    const res = await fetch(url, { method: "GET" });
+    const data = await res.json();
+    if (!data || data.ok === false) throw new Error((data && data.message) || "ตอบกลับไม่ถูกต้อง");
+    return data; // { ok, service, version, time }
+  }
+
+  function logout() { setToken(""); }
+
+  return {
+    rpc, login, listPatients, assignCaregiver, submitVisit, ping, logout,
+    getBaseUrl, setBaseUrl, getToken, setToken, isLive, normalizePatient
+  };
+})();
+
+if (typeof window !== "undefined") Object.assign(window, { LTC_API });
+
+
+/* ╔═══════════════════════════════════════════════════════════════════════╗
    ║  SECTION 1 · data.jsx                                                 ║
    ║  Mock data + Thai-language reference tables + scoring rubrics         ║
    ║  Exposes: CURRENT_USER, ALL_ROLES, PATIENTS, RELATIONS, CAREGIVERS,   ║
@@ -64,7 +188,10 @@ const PATIENTS = [
     last_visit: "21/05/2569",
     visit_count: 6,
     risk: "ปกติ",
-    distance_km: 1.2
+    distance_km: 1.2,
+    assigned_cg: "CG-007",      // ผู้รับผิดชอบ (Care Giver)
+    due_today: true,            // ต้องเยี่ยมวันนี้
+    visited_today: true         // เยี่ยมแล้ววันนี้
   },
   {
     pid: "1490800234567",
@@ -80,7 +207,10 @@ const PATIENTS = [
     last_visit: "18/05/2569",
     visit_count: 11,
     risk: "เสี่ยงสูง",
-    distance_km: 0.6
+    distance_km: 0.6,
+    assigned_cg: "CG-007",
+    due_today: true,
+    visited_today: false
   },
   {
     pid: "1490800345678",
@@ -96,7 +226,10 @@ const PATIENTS = [
     last_visit: "23/05/2569",
     visit_count: 4,
     risk: "เฝ้าระวัง",
-    distance_km: 2.4
+    distance_km: 2.4,
+    assigned_cg: "CG-007",
+    due_today: true,
+    visited_today: false
   },
   {
     pid: "1490800456789",
@@ -112,7 +245,10 @@ const PATIENTS = [
     last_visit: "10/05/2569",
     visit_count: 2,
     risk: "ปกติ",
-    distance_km: 3.1
+    distance_km: 3.1,
+    assigned_cg: "CG-007",
+    due_today: false,
+    visited_today: false
   }
 ];
 
@@ -438,11 +574,12 @@ function PrimaryButton({ children, onClick, loading, disabled, className = "", i
   );
 }
 
-function GhostButton({ children, onClick, className = "", icon }) {
+function GhostButton({ children, onClick, className = "", icon, disabled }) {
   return (
     <button
       onClick={onClick}
-      className={"h-12 px-5 rounded-2xl border border-ink-200 bg-white text-ink-800 font-medium text-[15px] active:scale-[0.99] transition flex items-center justify-center gap-2 " + className}
+      disabled={disabled}
+      className={"h-12 px-5 rounded-2xl border border-ink-200 bg-white text-ink-800 font-medium text-[15px] active:scale-[0.99] transition flex items-center justify-center gap-2 disabled:opacity-60 disabled:active:scale-100 " + className}
     >
       {icon}
       {children}
@@ -744,16 +881,20 @@ function LoginScreen({ onLogin }) {
   const [show, setShow] = uS1(false);
   const [loading, setLoading] = uS1(false);
 
-  const submit = () => {
+  const submit = async () => {
     if (!username || !password) {
       Swal.fire({ icon: "warning", title: "กรอกข้อมูลไม่ครบ", text: "กรุณาระบุชื่อผู้ใช้และรหัสผ่าน" });
       return;
     }
     setLoading(true);
-    setTimeout(() => {
+    try {
+      const r = await LTC_API.login(username, password, role);
       setLoading(false);
-      onLogin(role);
-    }, 700);
+      onLogin(r.role || role);
+    } catch (e) {
+      setLoading(false);
+      Swal.fire({ icon: "error", title: "เข้าสู่ระบบไม่สำเร็จ", text: e.message || String(e) });
+    }
   };
 
   return (
@@ -858,11 +999,33 @@ function LoginScreen({ onLogin }) {
 function HomeScreen({ onOpenNewVisit, onOpenPatient, onLogout }) {
   const [tab, setTab] = uS1("all");
   const [q, setQ] = uS1("");
+  const [view, setView] = uS1("home"); // home · report · map · me
+  const [roster, setRoster] = uS1(PATIENTS);
 
   const today = thaiDateString();
-  const filtered = PATIENTS.filter(p => {
+
+  // Load from the real backend when an API URL is configured; otherwise the
+  // mock PATIENTS seed keeps the prototype fully functional offline.
+  uE1(() => {
+    let alive = true;
+    if (LTC_API.isLive()) {
+      LTC_API.listPatients({}).then(list => {
+        if (alive && Array.isArray(list)) setRoster(list);
+      }).catch(() => {});
+    }
+    return () => { alive = false; };
+  }, []);
+
+  // CG scoping — a Care Giver sees only the cases assigned to them.
+  // (Live backend already scopes caregivers server-side; mock filters here.)
+  const myPatients = LTC_API.isLive()
+    ? roster
+    : roster.filter(p => p.assigned_cg === CURRENT_USER.user_id);
+
+  const filtered = myPatients.filter(p => {
     if (tab === "risk" && p.risk === "ปกติ") return false;
     if (tab === "bed" && p.adl_group !== "ติดเตียง") return false;
+    if (tab === "today" && !p.due_today) return false;
     if (q) {
       const needle = q.toLowerCase();
       return (p.name + p.pid + p.village).toLowerCase().includes(needle);
@@ -870,8 +1033,11 @@ function HomeScreen({ onOpenNewVisit, onOpenPatient, onLogout }) {
     return true;
   });
 
-  const riskCount = PATIENTS.filter(p => p.risk !== "ปกติ").length;
-  const todayPlanned = 3;
+  // Computed stats (no hardcoded figures)
+  const riskCount = myPatients.filter(p => p.risk !== "ปกติ").length;
+  const todayPlanned = myPatients.filter(p => p.due_today).length;
+  const visitedToday = myPatients.filter(p => p.due_today && p.visited_today).length;
+  const donePct = todayPlanned ? Math.round((visitedToday / todayPlanned) * 100) : 0;
 
   return (
     <div className="phone phone-bg pb-32">
@@ -879,9 +1045,7 @@ function HomeScreen({ onOpenNewVisit, onOpenPatient, onLogout }) {
 
       {/* Greeting header */}
       <header className="px-5 pt-2 pb-4 flex items-center gap-3">
-        <div className="w-11 h-11 rounded-full bg-ink-800 text-white grid place-items-center font-medium text-[15px]">
-          {CURRENT_USER.initials}
-        </div>
+        <LogoMark size={44}/>
         <div className="flex-1 min-w-0">
           <div className="text-[12px] text-ink-500">สวัสดี · {today}</div>
           <div className="text-[15px] font-medium text-ink-900 truncate">{CURRENT_USER.name}</div>
@@ -898,89 +1062,99 @@ function HomeScreen({ onOpenNewVisit, onOpenPatient, onLogout }) {
         </button>
       </header>
 
-      {/* Today summary */}
-      <div className="mx-5 mb-5 rounded-3xl bg-ink-800 text-white p-5 shadow-pop overflow-hidden relative">
-        <div className="absolute -top-8 -right-8 w-40 h-40 rounded-full bg-white/5"></div>
-        <div className="absolute -bottom-10 -right-2 w-32 h-32 rounded-full bg-white/5"></div>
-        <div className="relative">
-          <div className="text-[11px] uppercase tracking-[0.18em] text-white/60">วันนี้</div>
-          <div className="mt-1 flex items-end gap-2">
-            <div className="text-[40px] font-medium leading-none tnum">{todayPlanned}</div>
-            <div className="text-[13px] text-white/80 pb-1">เคสที่ต้องเยี่ยม</div>
-          </div>
-          <div className="mt-3 flex gap-2 text-[12px]">
-            <div className="px-2.5 py-1 rounded-full bg-white/10 inline-flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-accent-coral"></span>
-              เสี่ยงสูง {riskCount}
+      {view === "home" ? (
+        <>
+          {/* Today summary */}
+          <div className="mx-5 mb-5 rounded-3xl bg-ink-800 text-white p-5 shadow-pop overflow-hidden relative">
+            <div className="absolute -top-8 -right-8 w-40 h-40 rounded-full bg-white/5"></div>
+            <div className="absolute -bottom-10 -right-2 w-32 h-32 rounded-full bg-white/5"></div>
+            <div className="relative">
+              <div className="text-[11px] uppercase tracking-[0.18em] text-white/60">วันนี้</div>
+              <div className="mt-1 flex items-end gap-2">
+                <div className="text-[40px] font-medium leading-none tnum">{todayPlanned}</div>
+                <div className="text-[13px] text-white/80 pb-1">เคสที่ต้องเยี่ยม</div>
+              </div>
+              <div className="mt-3 flex gap-2 text-[12px]">
+                <div className="px-2.5 py-1 rounded-full bg-white/10 inline-flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-accent-coral"></span>
+                  เสี่ยงสูง {riskCount}
+                </div>
+                <div className="px-2.5 py-1 rounded-full bg-white/10">เยี่ยมแล้ว {visitedToday} / {todayPlanned}</div>
+              </div>
+              <div className="mt-4 h-1.5 rounded-full bg-white/15 overflow-hidden">
+                <div className="h-full bg-accent-sage2" style={{ width: donePct + "%" }}></div>
+              </div>
             </div>
-            <div className="px-2.5 py-1 rounded-full bg-white/10">เยี่ยมแล้ว 1 / {todayPlanned}</div>
           </div>
-          <div className="mt-4 h-1.5 rounded-full bg-white/15 overflow-hidden">
-            <div className="h-full bg-accent-sage2" style={{ width: "33%" }}></div>
+
+          {/* Search */}
+          <div className="px-5 mb-3">
+            <div className="flex items-stretch rounded-2xl bg-white border border-ink-200 focus-within:border-ink-700">
+              <span className="self-center pl-4 text-ink-400">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>
+                </svg>
+              </span>
+              <input
+                value={q}
+                onChange={e => setQ(e.target.value)}
+                placeholder="ค้นหา ชื่อ / PID / หมู่บ้าน"
+                className="flex-1 h-12 px-3 bg-transparent outline-none text-[14px] placeholder:text-ink-400"
+              />
+              <button className="self-center pr-4 text-ink-500" aria-label="กรอง">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="4" y1="6" x2="20" y2="6"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="10" y1="18" x2="14" y2="18"/>
+                </svg>
+              </button>
+            </div>
           </div>
-        </div>
-      </div>
 
-      {/* Search */}
-      <div className="px-5 mb-3">
-        <div className="flex items-stretch rounded-2xl bg-white border border-ink-200 focus-within:border-ink-700">
-          <span className="self-center pl-4 text-ink-400">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>
-            </svg>
-          </span>
-          <input
-            value={q}
-            onChange={e => setQ(e.target.value)}
-            placeholder="ค้นหา ชื่อ / PID / หมู่บ้าน"
-            className="flex-1 h-12 px-3 bg-transparent outline-none text-[14px] placeholder:text-ink-400"
-          />
-          <button className="self-center pr-4 text-ink-500" aria-label="กรอง">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-              <line x1="4" y1="6" x2="20" y2="6"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="10" y1="18" x2="14" y2="18"/>
-            </svg>
-          </button>
-        </div>
-      </div>
-
-      {/* Tabs */}
-      <div className="px-5 mb-3 flex gap-1.5 overflow-x-auto no-scrollbar">
-        {[
-          { id: "all",  label: "ทั้งหมด · " + PATIENTS.length },
-          { id: "risk", label: "เคสเสี่ยง · " + riskCount },
-          { id: "bed",  label: "ติดเตียง · " + PATIENTS.filter(p=>p.adl_group==="ติดเตียง").length },
-          { id: "today",label: "วันนี้ · " + todayPlanned }
-        ].map(t => {
-          const on = tab === t.id;
-          return (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              className={
-                "shrink-0 h-9 px-3.5 rounded-full text-[12.5px] transition " +
-                (on ? "bg-ink-800 text-white" : "bg-white border border-ink-200 text-ink-700")
-              }
-            >{t.label}</button>
-          );
-        })}
-      </div>
-
-      {/* Patient cards */}
-      <div className="px-5 space-y-3">
-        {filtered.map(p => <PatientCard key={p.pid} p={p} onOpen={() => onOpenPatient(p)}/>)}
-        {filtered.length === 0 ? (
-          <div className="rounded-2xl border border-dashed border-ink-200 p-8 text-center text-ink-500 text-[13px]">
-            ไม่พบเคสที่ตรงกับเงื่อนไข
+          {/* Tabs */}
+          <div className="px-5 mb-3 flex gap-1.5 overflow-x-auto no-scrollbar">
+            {[
+              { id: "all",  label: "ทั้งหมด · " + myPatients.length },
+              { id: "risk", label: "เคสเสี่ยง · " + riskCount },
+              { id: "bed",  label: "ติดเตียง · " + myPatients.filter(p=>p.adl_group==="ติดเตียง").length },
+              { id: "today",label: "วันนี้ · " + todayPlanned }
+            ].map(t => {
+              const on = tab === t.id;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => setTab(t.id)}
+                  className={
+                    "shrink-0 h-9 px-3.5 rounded-full text-[12.5px] transition " +
+                    (on ? "bg-ink-800 text-white" : "bg-white border border-ink-200 text-ink-700")
+                  }
+                >{t.label}</button>
+              );
+            })}
           </div>
-        ) : null}
-      </div>
+
+          {/* Patient cards */}
+          <div className="px-5 space-y-3">
+            {filtered.map(p => <PatientCard key={p.pid} p={p} onOpen={() => onOpenPatient(p)}/>)}
+            {filtered.length === 0 ? (
+              <div className="rounded-2xl border border-dashed border-ink-200 p-8 text-center text-ink-500 text-[13px]">
+                ไม่พบเคสที่ตรงกับเงื่อนไข
+              </div>
+            ) : null}
+          </div>
+        </>
+      ) : view === "report" ? (
+        <CGReportPanel patients={myPatients} riskCount={riskCount} todayPlanned={todayPlanned} visitedToday={visitedToday}/>
+      ) : view === "map" ? (
+        <CGMapPanel patients={myPatients} onOpenPatient={onOpenPatient}/>
+      ) : (
+        <CGProfilePanel patients={myPatients} onLogout={onLogout}/>
+      )}
 
       {/* Bottom nav */}
       <nav className="fixed bottom-0 left-0 right-0 z-20 pointer-events-none">
         <div className="phone-w pointer-events-auto bg-white/95 backdrop-blur border-t border-ink-100 px-3 py-2 flex items-center justify-around">
           {[
             { id: "home", label: "เคส", icon: "M3 12l9-8 9 8M5 10v10h14V10" },
-            { id: "rep",  label: "รายงาน", icon: "M4 4h12l4 4v12H4z M14 4v6h6" },
+            { id: "report", label: "รายงาน", icon: "M4 4h12l4 4v12H4z M14 4v6h6" },
             { id: "fab",  fab: true },
             { id: "map",  label: "แผนที่", icon: "M9 3l-6 3v15l6-3 6 3 6-3V3l-6 3z" },
             { id: "me",   label: "บัญชี", icon: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M4 21c1.5-4 5-6 8-6s6.5 2 8 6" }
@@ -994,15 +1168,201 @@ function HomeScreen({ onOpenNewVisit, onOpenPatient, onLogout }) {
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round"><path d="M12 5v14M5 12h14"/></svg>
             </button>
           ) : (
-            <button key={item.id} className="flex-1 flex flex-col items-center gap-0.5 py-1 text-ink-500">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            <button
+              key={item.id}
+              onClick={() => setView(item.id)}
+              className={"flex-1 flex flex-col items-center gap-0.5 py-1 transition " + (view === item.id ? "text-ink-800" : "text-ink-500")}
+              aria-current={view === item.id ? "page" : undefined}
+            >
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={view === item.id ? 2.1 : 1.6} strokeLinecap="round" strokeLinejoin="round">
                 {item.icon.split(" ").map((d,i) => <path key={i} d={d}/>)}
               </svg>
-              <span className="text-[10.5px]">{item.label}</span>
+              <span className={"text-[10.5px] " + (view === item.id ? "font-medium" : "")}>{item.label}</span>
             </button>
           ))}
         </div>
       </nav>
+    </div>
+  );
+}
+
+// ───────────────────────────────────────────── Care Giver · Report panel
+function CGReportPanel({ patients, riskCount, todayPlanned, visitedToday }) {
+  const byAdl = (g) => patients.filter(p => p.adl_group === g).length;
+  const myVisits = VISITS.filter(v => v.cg === CURRENT_USER.name);
+  const adlGroups = [
+    { g: "ติดสังคม", tone: "ok" },
+    { g: "ติดบ้าน",  tone: "warning" },
+    { g: "ติดเตียง", tone: "danger" }
+  ];
+  return (
+    <div className="px-5 space-y-4">
+      <div className="grid grid-cols-2 gap-3">
+        <div className="rounded-2xl bg-white border border-ink-100 shadow-card p-4">
+          <div className="text-[26px] font-medium text-ink-900 tnum leading-none">{patients.length}</div>
+          <div className="text-[12px] text-ink-600 mt-1">เคสในความรับผิดชอบ</div>
+        </div>
+        <div className="rounded-2xl bg-white border border-ink-100 shadow-card p-4">
+          <div className="text-[26px] font-medium text-ink-900 tnum leading-none">{myVisits.length}</div>
+          <div className="text-[12px] text-ink-600 mt-1">การเยี่ยมของฉัน</div>
+        </div>
+        <div className="rounded-2xl bg-white border border-ink-100 shadow-card p-4">
+          <div className="text-[26px] font-medium text-accent-coral tnum leading-none">{riskCount}</div>
+          <div className="text-[12px] text-ink-600 mt-1">เคสเสี่ยง / เฝ้าระวัง</div>
+        </div>
+        <div className="rounded-2xl bg-white border border-ink-100 shadow-card p-4">
+          <div className="text-[26px] font-medium text-accent-sage tnum leading-none">{visitedToday}/{todayPlanned}</div>
+          <div className="text-[12px] text-ink-600 mt-1">เยี่ยมแล้ววันนี้</div>
+        </div>
+      </div>
+
+      <SectionCard title="แยกตามระดับการพึ่งพิง">
+        <div className="space-y-2.5">
+          {adlGroups.map(({ g, tone }) => {
+            const n = byAdl(g);
+            const pct = patients.length ? Math.round((n / patients.length) * 100) : 0;
+            const t = TONE[tone] || TONE.neutral;
+            return (
+              <div key={g}>
+                <div className="flex items-center justify-between text-[12.5px] mb-1">
+                  <span className="text-ink-700 inline-flex items-center gap-1.5">
+                    <span className={"w-2 h-2 rounded-full " + t.dot}></span>{g}
+                  </span>
+                  <span className="text-ink-500 tnum">{n} เคส</span>
+                </div>
+                <div className="h-1.5 rounded-full bg-ink-100 overflow-hidden">
+                  <div className={"h-full " + t.dot} style={{ width: pct + "%" }}></div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </SectionCard>
+
+      <SectionCard title="การเยี่ยมล่าสุดของฉัน" subtitle={`${myVisits.length} รายการ`}>
+        {myVisits.length ? (
+          <div className="space-y-2">
+            {myVisits.map(v => (
+              <div key={v.id} className="flex items-center gap-3 py-1.5">
+                <div className="w-9 h-9 rounded-xl bg-paper grid place-items-center text-[11px] font-medium text-ink-700">
+                  {v.name.replace(/^น(าง|าย|.ส.)\s*/,"").slice(0,2)}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[13px] text-ink-900 truncate">{v.name}</div>
+                  <div className="text-[11px] text-ink-500">ADL {v.adl} · 9Q {v.q9}{v.q8 ? ` · 8Q ${v.q8}` : ""}</div>
+                </div>
+                <div className="text-[11px] text-ink-500 tnum shrink-0">{v.date}</div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-center text-ink-500 text-[13px] py-4">ยังไม่มีการเยี่ยม</div>
+        )}
+      </SectionCard>
+    </div>
+  );
+}
+
+// ───────────────────────────────────────────── Care Giver · Map panel
+function CGMapPanel({ patients, onOpenPatient }) {
+  const elRef = useRef(null);
+  const mapRef = useRef(null);
+  const CENTER = [16.5418, 104.7237]; // รพ.สต.บ้านทรายไหลแล้ง (มุกดาหาร)
+
+  // stable pseudo-coordinate from distance + pid so demo markers don't jump
+  const coordFor = (p) => {
+    let seed = 0;
+    for (let i = 0; i < p.pid.length; i++) seed = (seed * 31 + p.pid.charCodeAt(i)) % 360;
+    const bearing = seed * Math.PI / 180;
+    const dKm = p.distance_km || 1;
+    const dLat = (dKm / 111) * Math.cos(bearing);
+    const dLng = (dKm / (111 * Math.cos(CENTER[0] * Math.PI / 180))) * Math.sin(bearing);
+    return [CENTER[0] + dLat, CENTER[1] + dLng];
+  };
+
+  useEffect(() => {
+    if (!elRef.current || mapRef.current || typeof L === "undefined") return;
+    const map = L.map(elRef.current, { zoomControl: false, attributionControl: false }).setView(CENTER, 14);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
+    L.control.zoom({ position: "bottomright" }).addTo(map);
+    // health center
+    L.circleMarker(CENTER, { radius: 7, color: "#13224a", fillColor: "#13224a", fillOpacity: 1, weight: 2 })
+      .addTo(map).bindPopup("รพ.สต.บ้านทรายไหลแล้ง");
+    // patient markers (approximate, prototype)
+    patients.forEach(p => {
+      const tone = p.risk === "เสี่ยงสูง" ? "#c0533f" : p.risk === "เฝ้าระวัง" ? "#b58a3c" : "#3e8e6a";
+      L.circleMarker(coordFor(p), { radius: 6, color: "#fff", weight: 2, fillColor: tone, fillOpacity: 1 })
+        .addTo(map).bindPopup(`<b>${p.name}</b><br/>${p.adl_group} · ${p.risk}<br/>ห่าง ${p.distance_km} กม.`);
+    });
+    mapRef.current = map;
+    setTimeout(() => map.invalidateSize(), 120);
+    return () => { map.remove(); mapRef.current = null; };
+  }, []);
+
+  const sorted = [...patients].sort((a, b) => (a.distance_km || 0) - (b.distance_km || 0));
+
+  return (
+    <div className="px-5 space-y-3">
+      <div ref={elRef} className="rounded-3xl overflow-hidden border border-ink-200 shadow-card" style={{ height: 260 }}></div>
+      <div className="text-[11px] text-ink-400 px-1">ตำแหน่งเป็นค่าโดยประมาณสำหรับตัวอย่าง · เรียงตามระยะทางจาก รพ.สต.</div>
+      <div className="space-y-2">
+        {sorted.map(p => {
+          const tone = p.risk === "เสี่ยงสูง" ? "danger" : p.risk === "เฝ้าระวัง" ? "warning" : "ok";
+          const t = TONE[tone] || TONE.neutral;
+          return (
+            <button
+              key={p.pid}
+              onClick={() => onOpenPatient(p)}
+              className="w-full text-left rounded-2xl bg-white border border-ink-100 shadow-card p-3.5 flex items-center gap-3 active:scale-[.995] transition"
+            >
+              <span className={"w-2.5 h-2.5 rounded-full shrink-0 " + t.dot}></span>
+              <span className="flex-1 min-w-0">
+                <div className="text-[13.5px] font-medium text-ink-900 truncate">{p.name}</div>
+                <div className="text-[11.5px] text-ink-500 truncate">{p.village}</div>
+              </span>
+              <span className="text-[12px] text-ink-600 tnum shrink-0">{p.distance_km} กม.</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ───────────────────────────────────────────── Care Giver · Profile panel
+function CGProfilePanel({ patients, onLogout }) {
+  const myVisits = VISITS.filter(v => v.cg === CURRENT_USER.name).length;
+  const changePw = () => Swal.fire({
+    icon: "info",
+    title: "เปลี่ยนรหัสผ่าน",
+    text: "ฟีเจอร์นี้จะเชื่อมต่อกับระบบจริงเมื่อพร้อมใช้งาน",
+    confirmButtonText: "ตกลง"
+  });
+  return (
+    <div className="px-5 space-y-4">
+      <div className="rounded-3xl bg-white border border-ink-100 shadow-card p-5 flex items-center gap-4">
+        <LogoMark size={56}/>
+        <div className="min-w-0">
+          <div className="text-[16px] font-medium text-ink-900 truncate">{CURRENT_USER.name}</div>
+          <div className="text-[12px] text-ink-500">{CURRENT_USER.role} · {CURRENT_USER.user_id}</div>
+        </div>
+      </div>
+
+      <SectionCard title="ข้อมูลเจ้าหน้าที่">
+        <div className="space-y-2 text-[13px]">
+          <div className="flex justify-between"><span className="text-ink-500">พื้นที่รับผิดชอบ</span><span className="text-ink-900">{CURRENT_USER.village}</span></div>
+          <div className="flex justify-between"><span className="text-ink-500">เบอร์ติดต่อ</span><span className="text-ink-900 tnum">{CURRENT_USER.phone}</span></div>
+          <div className="flex justify-between"><span className="text-ink-500">เคสในความรับผิดชอบ</span><span className="text-ink-900 tnum">{patients.length} เคส</span></div>
+          <div className="flex justify-between"><span className="text-ink-500">การเยี่ยมสะสม</span><span className="text-ink-900 tnum">{myVisits} ครั้ง</span></div>
+        </div>
+      </SectionCard>
+
+      <div className="space-y-2.5">
+        <GhostButton onClick={changePw} className="w-full">เปลี่ยนรหัสผ่าน</GhostButton>
+        <GhostButton onClick={onLogout} className="w-full text-accent-coral border-accent-coral/30">ออกจากระบบ</GhostButton>
+      </div>
+
+      <div className="text-center text-[11px] text-ink-400 pt-2">v1.0 · LTC Care · 2569</div>
     </div>
   );
 }
@@ -1075,12 +1435,14 @@ function AdminDashboard({ onLogout, onNav }) {
 
   // ─── KPIs derived from VISITS + PATIENTS ─────────────────────────────────
   const k = umD(() => {
-    const cases = PATIENTS.length + 12;          // mocked roster size
-    const visits = VISITS.length + 24;            // total visits to-date
+    const cases = PATIENTS.length;                // roster size (from data)
+    const visits = VISITS.length;                 // total visits to-date (from data)
     const lowADL = VISITS.filter(v => v.adl <= 11).length;
     const high9Q = VISITS.filter(v => v.q9 >= 7).length;
     const has8Q = VISITS.filter(v => v.q8 > 0).length;
-    const visitsToday = VISITS.filter(v => v.date === "24/05/2569").length;
+    // VISITS is ordered newest-first; count visits on the latest recorded day
+    const latestDate = VISITS.length ? VISITS[0].date : null;
+    const visitsToday = latestDate ? VISITS.filter(v => v.date === latestDate).length : 0;
     return { cases, visits, lowADL, high9Q, has8Q, visitsToday };
   }, []);
 
@@ -1117,9 +1479,7 @@ function AdminDashboard({ onLogout, onNav }) {
 
       {/* Identity header */}
       <header className="px-5 pt-2 pb-3 flex items-center gap-3">
-        <div className="w-11 h-11 rounded-2xl bg-ink-800 text-white grid place-items-center font-medium text-[15px]">
-          {ADMIN_USER.initials}
-        </div>
+        <LogoMark size={44}/>
         <div className="flex-1 min-w-0">
           <div className="text-[11.5px] text-ink-500">{ADMIN_USER.role}</div>
           <div className="text-[15px] font-medium text-ink-900 truncate">{ADMIN_USER.name}</div>
@@ -1169,10 +1529,10 @@ function AdminDashboard({ onLogout, onNav }) {
 
       {/* KPI tiles */}
       <div className="px-5 grid grid-cols-2 gap-3 mb-4">
-        <KPI value={k.cases}   label="จำนวนเคสทั้งหมด" sub="เคสในความรับผิดชอบ" tone="neutral" trend="+3"/>
-        <KPI value={k.visits}  label="ครั้งเยี่ยมทั้งหมด" sub={`วันนี้ ${k.visitsToday} ครั้ง`} tone="ok" trend="+12"/>
-        <KPI value={k.lowADL}  label="เคส ADL ≤ 11" sub="ติดบ้าน / ติดเตียง" tone="warning" trend="0"/>
-        <KPI value={k.high9Q}  label="เคส 9Q ≥ 7" sub="ภาวะซึมเศร้า" tone="warning" trend="+1"/>
+        <KPI value={k.cases}   label="จำนวนเคสทั้งหมด" sub="เคสในความรับผิดชอบ" tone="neutral"/>
+        <KPI value={k.visits}  label="ครั้งเยี่ยมทั้งหมด" sub={`วันนี้ ${k.visitsToday} ครั้ง`} tone="ok"/>
+        <KPI value={k.lowADL}  label="เคส ADL ≤ 11" sub="ติดบ้าน / ติดเตียง" tone="warning"/>
+        <KPI value={k.high9Q}  label="เคส 9Q ≥ 7" sub="ภาวะซึมเศร้า" tone="warning"/>
       </div>
 
       {/* Critical risk callout */}
@@ -1321,11 +1681,30 @@ function AdminDashboard({ onLogout, onNav }) {
       <div className="h-6"></div>
 
       {/* Admin quick actions */}
-      <div className="px-5 grid grid-cols-2 gap-3 mb-6">
-        <AdminAction icon="users"    label="จัดการผู้ใช้งาน" sub={`${CAREGIVERS.length} คน`}     onClick={() => onNav?.("users")}/>
-        <AdminAction icon="patients" label="ทะเบียนผู้สูงอายุ" sub={`${k.cases} เคส`}        onClick={() => onNav?.("patients")}/>
-        <AdminAction icon="settings" label="ตั้งค่าระบบ"     sub="role · ฟอร์ม · พื้นที่"/>
-        <AdminAction icon="audit"    label="audit log"        sub="กิจกรรมการแก้ไข"/>
+      <div className="px-5 mb-6">
+        {/* Headline action — assign Care Givers to cases */}
+        <button
+          onClick={() => onNav?.("assign")}
+          className="w-full mb-3 rounded-3xl bg-ink-800 text-white p-4 flex items-center gap-3 shadow-card active:scale-[.995] transition text-left"
+        >
+          <span className="w-11 h-11 rounded-2xl bg-white/10 grid place-items-center">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6"/><path d="M22 11h-6"/>
+            </svg>
+          </span>
+          <span className="flex-1 min-w-0">
+            <div className="text-[14.5px] font-medium">มอบหมาย Care Giver</div>
+            <div className="text-[11.5px] text-white/70">กำหนดผู้รับผิดชอบรายเคส</div>
+          </span>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+
+        <div className="grid grid-cols-2 gap-3">
+          <AdminAction icon="users"    label="จัดการผู้ใช้งาน" sub={`${CAREGIVERS.length} คน`}     onClick={() => onNav?.("users")}/>
+          <AdminAction icon="patients" label="ทะเบียนผู้สูงอายุ" sub={`${k.cases} เคส`}        onClick={() => onNav?.("patients")}/>
+          <AdminAction icon="settings" label="ตั้งค่าระบบ"     sub="ฟอร์ม · พื้นที่"        onClick={() => onNav?.("settings")}/>
+          <AdminAction icon="audit"    label="audit log"        sub="กิจกรรมการแก้ไข"      onClick={() => onNav?.("audit")}/>
+        </div>
       </div>
 
       <div className="text-center text-[11px] text-ink-400 pb-6">
@@ -2026,6 +2405,15 @@ function PatientEditor({ patient, onSave, onDelete, onClose }) {
         </Field>
       </div>
       <div className="dotted-rule"></div>
+      <Field label="ผู้รับผิดชอบ (Care Giver)" hint="เจ้าหน้าที่ผู้บันทึกการเยี่ยมในระบบ">
+        <Select
+          value={d.assigned_cg}
+          onChange={e => set({ assigned_cg: e.target.value })}
+          placeholder="ยังไม่มอบหมาย"
+          options={CAREGIVERS.filter(c => c.active).map(c => ({ value: c.id, label: `${c.name} · ${c.village}` }))}
+        />
+      </Field>
+      <div className="dotted-rule"></div>
       <div className="grid grid-cols-2 gap-3">
         <Field label="ระดับการพึ่งพิง">
           <Select value={d.adl_group} onChange={e => set({ adl_group: e.target.value })} options={["ติดสังคม","ติดบ้าน","ติดเตียง"]}/>
@@ -2038,7 +2426,365 @@ function PatientEditor({ patient, onSave, onDelete, onClose }) {
   );
 }
 
-Object.assign(window, { UsersScreen, PatientsScreen, BottomSheet });
+// ─────────────────────────────────────────────── Assign Care Giver (Admin)
+function AssignScreen({ onBack }) {
+  const [list, setList] = usM(() => (PATIENTS || []).map(p => ({ ...p })));
+  const [q, setQ] = usM("");
+  const [picking, setPicking] = usM(null); // patient currently being (re)assigned
+
+  // Load the full roster from the backend when configured (admin sees all).
+  ueM(() => {
+    let alive = true;
+    if (LTC_API.isLive()) {
+      LTC_API.listPatients({}).then(rows => {
+        if (alive && Array.isArray(rows)) setList(rows);
+      }).catch(() => {});
+    }
+    return () => { alive = false; };
+  }, []);
+
+  const cgById = umM(() => {
+    const m = {};
+    CAREGIVERS.forEach(c => { m[c.id] = c; });
+    return m;
+  }, []);
+
+  const filtered = umM(() => list.filter(p => {
+    if (!q) return true;
+    const n = q.toLowerCase();
+    const cgName = (cgById[p.assigned_cg] && cgById[p.assigned_cg].name) || "";
+    return (p.name + p.pid + p.village + cgName).toLowerCase().includes(n);
+  }), [list, q, cgById]);
+
+  const assignedCount = umM(() => list.filter(p => p.assigned_cg).length, [list]);
+  const unassignedCount = list.length - assignedCount;
+
+  const apply = async (pid, cgId) => {
+    const name = cgId ? (cgById[cgId] && cgById[cgId].name) || cgId : null;
+    try {
+      // Persist to the backend (assignCaregiver is admin-only and validates the
+      // Care Giver). The backend has no "unassign" endpoint, so clearing an
+      // assignment stays client-side for now.
+      if (cgId) await LTC_API.assignCaregiver(pid, cgId);
+      setList(list.map(p => p.pid === pid ? { ...p, assigned_cg: cgId } : p));
+      setPicking(null);
+      Swal.fire({
+        icon: "success",
+        title: cgId ? "มอบหมายสำเร็จ" : "ยกเลิกการมอบหมายแล้ว",
+        html: cgId ? `มอบหมายให้ <b>${name}</b>` : undefined,
+        timer: 1200, showConfirmButton: false
+      });
+    } catch (e) {
+      Swal.fire({ icon: "error", title: "มอบหมายไม่สำเร็จ", text: e.message || String(e) });
+    }
+  };
+
+  return (
+    <div className="phone phone-bg pb-28">
+      <StatusBar/>
+      <AppHeader title="มอบหมาย Care Giver" subtitle={`${list.length} เคส · มอบหมายแล้ว ${assignedCount}`} onBack={onBack}/>
+
+      {/* Summary */}
+      <div className="px-5 grid grid-cols-2 gap-3 mb-4">
+        <div className="rounded-2xl bg-white border border-ink-100 shadow-card p-4">
+          <div className="text-[26px] font-medium text-ink-900 tnum leading-none">{assignedCount}</div>
+          <div className="text-[12px] text-ink-600 mt-1">มอบหมายแล้ว</div>
+        </div>
+        <div className={"rounded-2xl border shadow-card p-4 " + (unassignedCount ? "bg-accent-coral/5 border-accent-coral/30" : "bg-white border-ink-100")}>
+          <div className={"text-[26px] font-medium tnum leading-none " + (unassignedCount ? "text-accent-coral" : "text-ink-900")}>{unassignedCount}</div>
+          <div className="text-[12px] text-ink-600 mt-1">ยังไม่มอบหมาย</div>
+        </div>
+      </div>
+
+      {/* Search */}
+      <div className="px-5 mb-3">
+        <div className="flex items-stretch rounded-xl bg-white border border-ink-200">
+          <span className="self-center pl-3 text-ink-400">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+          </span>
+          <input value={q} onChange={e => setQ(e.target.value)} placeholder="ค้นหา ผู้สูงอายุ / Care Giver" className="flex-1 h-11 px-3 bg-transparent outline-none text-[13.5px]"/>
+        </div>
+      </div>
+
+      {/* List */}
+      <div className="px-5 space-y-3">
+        {filtered.map(p => {
+          const cg = cgById[p.assigned_cg];
+          return (
+            <div key={p.pid} className="rounded-3xl bg-white border border-ink-100 shadow-card p-4">
+              <div className="flex items-start gap-3">
+                <div className="w-11 h-11 rounded-2xl bg-paper grid place-items-center font-medium text-ink-700">
+                  {p.name.replace(/^น(าง|าย|.ส.)\s*/,"").slice(0,2)}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[14px] font-medium text-ink-900 truncate">{p.name}</div>
+                  <div className="text-[11.5px] text-ink-500 truncate">{p.village}</div>
+                  <div className="mt-2">
+                    {cg ? (
+                      <span className="inline-flex items-center gap-1.5 text-[12px] text-ink-700">
+                        <span className="w-1.5 h-1.5 rounded-full bg-accent-sage"></span>{cg.name}
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1.5 text-[12px] text-accent-coral">
+                        <span className="w-1.5 h-1.5 rounded-full bg-accent-coral"></span>ยังไม่มอบหมาย
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <button
+                  onClick={() => setPicking(p)}
+                  className="self-center shrink-0 h-9 px-3.5 rounded-full text-[12.5px] bg-ink-800 text-white active:scale-95 transition"
+                >{cg ? "เปลี่ยน" : "มอบหมาย"}</button>
+              </div>
+            </div>
+          );
+        })}
+        {filtered.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-ink-200 p-8 text-center text-ink-500 text-[13px]">ไม่พบเคสที่ตรงกับเงื่อนไข</div>
+        ) : null}
+      </div>
+
+      {/* Picker sheet */}
+      <BottomSheet
+        open={!!picking}
+        onClose={() => setPicking(null)}
+        title={picking ? `มอบหมาย · ${picking.name}` : ""}
+      >
+        {picking ? (
+          <div className="space-y-2">
+            {CAREGIVERS.filter(c => c.active).map(c => {
+              const on = picking.assigned_cg === c.id;
+              return (
+                <button
+                  key={c.id}
+                  onClick={() => apply(picking.pid, c.id)}
+                  className={"w-full text-left rounded-2xl border p-3.5 flex items-center gap-3 transition " + (on ? "radio-card-on" : "border-ink-200 bg-white")}
+                >
+                  <div className="w-10 h-10 rounded-xl bg-paper grid place-items-center font-medium text-ink-700">
+                    {c.name.replace(/^น(าง|าย|.ส.)\s*/,"").slice(0,2)}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[14px] font-medium text-ink-900 truncate">{c.name}</div>
+                    <div className="text-[11.5px] text-ink-500">{c.village} · ดูแล {c.cases} เคส</div>
+                  </div>
+                  {on ? <span className="text-[11px] text-ink-700 shrink-0">ปัจจุบัน</span> : null}
+                </button>
+              );
+            })}
+            {picking.assigned_cg ? (
+              <button
+                onClick={() => apply(picking.pid, "")}
+                className="w-full text-center rounded-2xl border border-accent-coral/30 text-accent-coral p-3 text-[13px]"
+              >ยกเลิกการมอบหมาย</button>
+            ) : null}
+          </div>
+        ) : null}
+      </BottomSheet>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────── System Settings (Admin)
+function SettingsScreen({ onBack }) {
+  const [cfg, setCfg] = usM({
+    requireGPS: true,
+    requirePhotos: true,
+    requireADL: true,
+    autoFlag8Q: true,
+    defaultRadiusKm: "5"
+  });
+  const set = (p) => setCfg(prev => ({ ...prev, ...p }));
+
+  // ── Backend connection (Task #15) ──────────────────────────────────────────
+  const [apiUrl, setApiUrl] = usM(LTC_API.getBaseUrl());
+  const [conn, setConn] = usM({ state: LTC_API.isLive() ? "live" : "mock", msg: "" });
+  const [testing, setTesting] = usM(false);
+
+  const testConnection = async () => {
+    const url = (apiUrl || "").trim();
+    if (!url) {
+      Swal.fire({ icon: "warning", title: "ยังไม่ได้กรอก URL", text: "วาง Web App URL ของ Google Apps Script ก่อนทดสอบ" });
+      return;
+    }
+    setTesting(true);
+    const prev = LTC_API.getBaseUrl();
+    try {
+      LTC_API.setBaseUrl(url);               // ping() reads from stored base URL
+      const data = await LTC_API.ping();
+      setConn({ state: "live", msg: `${data.service || "LTC"} v${data.version || "?"}` });
+      Swal.fire({ icon: "success", title: "เชื่อมต่อสำเร็จ", html: `<div style="font-size:13px;color:#13224a">${data.service || "LTC API"} · v${data.version || "?"}</div>`, timer: 1500, showConfirmButton: false });
+    } catch (e) {
+      LTC_API.setBaseUrl(prev);              // roll back on failure
+      setConn({ state: "error", msg: e.message || String(e) });
+      Swal.fire({ icon: "error", title: "เชื่อมต่อไม่สำเร็จ", text: e.message || String(e) });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const save = () => {
+    // Persist the API base URL so the app talks to the live backend next reload.
+    const url = (apiUrl || "").trim();
+    LTC_API.setBaseUrl(url);
+    setConn(c => ({ ...c, state: url ? "live" : "mock" }));
+    Swal.fire({
+      icon: "success",
+      title: "บันทึกการตั้งค่าแล้ว",
+      html: url
+        ? `<div style="font-size:13px;color:#506aa3">โหมดเชื่อมต่อ backend จริง</div>`
+        : `<div style="font-size:13px;color:#506aa3">โหมดตัวอย่าง (ไม่ได้ตั้งค่า URL)</div>`,
+      timer: 1300, showConfirmButton: false
+    });
+  };
+
+  const connBadge = conn.state === "live"
+    ? { bg: "bg-accent-sage/12", dot: "bg-accent-sage", text: "text-accent-sage", label: "เชื่อมต่อ backend จริง" }
+    : conn.state === "error"
+    ? { bg: "bg-accent-coral/12", dot: "bg-accent-coral", text: "text-accent-coral", label: "เชื่อมต่อไม่สำเร็จ" }
+    : { bg: "bg-ink-100", dot: "bg-ink-400", text: "text-ink-500", label: "โหมดตัวอย่าง (Mock)" };
+
+  return (
+    <div className="phone phone-bg pb-28">
+      <StatusBar/>
+      <AppHeader title="ตั้งค่าระบบ" subtitle="การเชื่อมต่อ · ฟอร์ม · พื้นที่" onBack={onBack}/>
+
+      <div className="px-5 space-y-5">
+        <SectionCard title="การเชื่อมต่อ Backend">
+          <div className="flex items-center gap-2 mb-3">
+            <span className={"inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11.5px] font-medium " + connBadge.bg + " " + connBadge.text}>
+              <span className={"w-1.5 h-1.5 rounded-full " + connBadge.dot}></span>
+              {connBadge.label}
+            </span>
+            {conn.msg ? <span className="text-[11px] text-ink-500 truncate">{conn.msg}</span> : null}
+          </div>
+          <Field label="Web App URL (Google Apps Script)" hint="วาง URL จากการ Deploy → Web app · เว้นว่างเพื่อใช้โหมดตัวอย่าง">
+            <input
+              value={apiUrl}
+              onChange={e => setApiUrl(e.target.value)}
+              placeholder="https://script.google.com/macros/s/.../exec"
+              spellCheck={false}
+              autoCapitalize="off"
+              className="w-full h-11 px-3 rounded-xl bg-white border border-ink-200 outline-none text-[12.5px] font-mono focus:border-ink-600"
+            />
+          </Field>
+          <div className="mt-2">
+            <GhostButton onClick={testConnection} disabled={testing} className={"w-full " + (testing ? "saving" : "")}>
+              {testing ? "กำลังทดสอบ…" : "ทดสอบการเชื่อมต่อ"}
+            </GhostButton>
+          </div>
+        </SectionCard>
+
+        <SectionCard title="ข้อกำหนดการบันทึกเยี่ยม">
+          <div className="space-y-2.5">
+            <Toggle value={cfg.requireGPS}    onChange={v => set({ requireGPS: v })}    label="บังคับพิกัด GPS" sub="ต้องระบุพิกัดก่อนบันทึกการเยี่ยม"/>
+            <Toggle value={cfg.requirePhotos} onChange={v => set({ requirePhotos: v })} label="บังคับแนบภาพถ่าย" sub="อย่างน้อย 1 ภาพต่อการเยี่ยม"/>
+            <Toggle value={cfg.requireADL}    onChange={v => set({ requireADL: v })}    label="บังคับประเมิน ADL" sub="ต้องทำแบบประเมิน Barthel ทุกครั้ง"/>
+            <Toggle value={cfg.autoFlag8Q}    onChange={v => set({ autoFlag8Q: v })}    label="แจ้งเตือนอัตโนมัติเมื่อ 8Q > 0" sub="ส่งเคสเข้า Case Manager ทันที"/>
+          </div>
+        </SectionCard>
+
+        <SectionCard title="พื้นที่รับผิดชอบ">
+          <Field label="รัศมีเขตบริการเริ่มต้น" hint="ใช้กับการคำนวณระยะทางการเยี่ยม">
+            <Select
+              value={cfg.defaultRadiusKm}
+              onChange={e => set({ defaultRadiusKm: e.target.value })}
+              options={[
+                { value: "3", label: "3 กิโลเมตร" },
+                { value: "5", label: "5 กิโลเมตร" },
+                { value: "10", label: "10 กิโลเมตร" }
+              ]}
+            />
+          </Field>
+          <div className="text-[12px] text-ink-500 leading-relaxed">
+            หมู่บ้านในความรับผิดชอบ: หมู่ 4 บ้านทรายไหลแล้ง · หมู่ 5 บ้านดอนสวรรค์ · หมู่ 6 บ้านนาทุ่ง · หมู่ 7 บ้านโนนหินดำ
+          </div>
+        </SectionCard>
+
+        <SectionCard title="ความปลอดภัย">
+          <div className="text-[12.5px] text-ink-600 leading-relaxed">
+            รหัสผ่านเริ่มต้นของผู้ใช้ใหม่คือ <b>1234</b> — กำหนดให้ผู้ใช้เปลี่ยนรหัสผ่านเมื่อเข้าใช้งานครั้งแรก
+          </div>
+          <div className="mt-2">
+            <GhostButton onClick={() => Swal.fire({ icon: "info", title: "รีเซ็ตรหัสผ่าน", text: "เลือกผู้ใช้จากเมนูจัดการผู้ใช้งานเพื่อรีเซ็ตรหัสผ่าน" })} className="w-full">
+              รีเซ็ตรหัสผ่านผู้ใช้
+            </GhostButton>
+          </div>
+        </SectionCard>
+
+        <PrimaryButton onClick={save} className="w-full">บันทึกการตั้งค่า</PrimaryButton>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────── Audit Log (Admin)
+const AUDIT_LOG = [
+  { id: "A-9001", ts: "03/06/2569 09:14", actor: "นพ.ธีรพงศ์  ภูวสิน", action: "assign_caregiver", target: "นางบุญมี  สุขสมบัติ", detail: "มอบหมายให้ ขนิษฐา  ภูเวียงคำ", tone: "neutral" },
+  { id: "A-9000", ts: "03/06/2569 08:52", actor: "ขนิษฐา  ภูเวียงคำ",  action: "submit_visit",     target: "นายเสริม  คำมูล",       detail: "บันทึกการเยี่ยม · ADL 4 · 8Q 6", tone: "warning" },
+  { id: "A-8999", ts: "02/06/2569 16:30", actor: "นพ.ธีรพงศ์  ภูวสิน", action: "create_user",       target: "ยุพิน  จันทร์สว่าง",     detail: "เพิ่มผู้ใช้ใหม่ · บทบาท Care Giver", tone: "ok" },
+  { id: "A-8998", ts: "02/06/2569 14:05", actor: "สมพงษ์  แก้วสีขาว",  action: "update_patient",    target: "นางจำปา  อินทร์ทอง",      detail: "แก้ไขระดับความเสี่ยง → เฝ้าระวัง", tone: "neutral" },
+  { id: "A-8997", ts: "02/06/2569 10:41", actor: "นพ.ธีรพงศ์  ภูวสิน", action: "reset_password",    target: "ประภา  สิงห์ทอง",       detail: "รีเซ็ตรหัสผ่าน", tone: "warning" },
+  { id: "A-8996", ts: "01/06/2569 09:00", actor: "ระบบ",              action: "login",             target: "ขนิษฐา  ภูเวียงคำ",     detail: "เข้าสู่ระบบสำเร็จ", tone: "ok" }
+];
+const AUDIT_LABELS = {
+  assign_caregiver: "มอบหมาย Care Giver",
+  submit_visit: "บันทึกการเยี่ยม",
+  create_user: "เพิ่มผู้ใช้",
+  update_patient: "แก้ไขข้อมูลผู้สูงอายุ",
+  reset_password: "รีเซ็ตรหัสผ่าน",
+  login: "เข้าสู่ระบบ"
+};
+
+function AuditLogScreen({ onBack }) {
+  const [q, setQ] = usM("");
+  const filtered = umM(() => AUDIT_LOG.filter(a => {
+    if (!q) return true;
+    const n = q.toLowerCase();
+    return (a.actor + a.target + a.detail + (AUDIT_LABELS[a.action] || a.action)).toLowerCase().includes(n);
+  }), [q]);
+
+  return (
+    <div className="phone phone-bg pb-28">
+      <StatusBar/>
+      <AppHeader title="บันทึกกิจกรรม (Audit Log)" subtitle={`${AUDIT_LOG.length} รายการล่าสุด`} onBack={onBack}/>
+
+      <div className="px-5 mb-3">
+        <div className="flex items-stretch rounded-xl bg-white border border-ink-200">
+          <span className="self-center pl-3 text-ink-400">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+          </span>
+          <input value={q} onChange={e => setQ(e.target.value)} placeholder="ค้นหา ผู้ใช้ / เคส / กิจกรรม" className="flex-1 h-11 px-3 bg-transparent outline-none text-[13.5px]"/>
+        </div>
+      </div>
+
+      <div className="px-5 space-y-2.5">
+        {filtered.map(a => {
+          const t = TONE[a.tone] || TONE.neutral;
+          return (
+            <div key={a.id} className="rounded-2xl bg-white border border-ink-100 shadow-card p-4">
+              <div className="flex items-center gap-2">
+                <span className={"w-7 h-7 rounded-lg grid place-items-center " + t.bg}>
+                  <span className={"w-2 h-2 rounded-full " + t.dot}></span>
+                </span>
+                <span className="text-[13px] font-medium text-ink-900">{AUDIT_LABELS[a.action] || a.action}</span>
+                <span className="ml-auto text-[11px] text-ink-500 tnum">{a.ts}</span>
+              </div>
+              <div className="mt-2 text-[12.5px] text-ink-700">{a.detail}</div>
+              <div className="mt-1 text-[11.5px] text-ink-500">
+                โดย {a.actor} · เป้าหมาย {a.target}
+              </div>
+            </div>
+          );
+        })}
+        {filtered.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-ink-200 p-8 text-center text-ink-500 text-[13px]">ไม่พบกิจกรรมที่ตรงกับเงื่อนไข</div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+Object.assign(window, { UsersScreen, PatientsScreen, BottomSheet, AssignScreen, SettingsScreen, AuditLogScreen });
 
 
 /* ╔═══════════════════════════════════════════════════════════════════════╗
@@ -3207,7 +3953,7 @@ function VisitFormScreen({ patient, onSaved, onCancel }) {
     set({ risk_level: risk ? "เสี่ยงสูง" : "ปกติ" });
   };
 
-  const trySave = () => {
+  const trySave = async () => {
     // light validation summary
     const issues = [];
     if (!form.cg_at_home) issues.push("ชื่อผู้ดูแลในครัวเรือน");
@@ -3225,11 +3971,14 @@ function VisitFormScreen({ patient, onSaved, onCancel }) {
       return;
     }
 
+    const totalADL = Object.values(form.adl).reduce((s,v)=>s+(v||0),0);
+    const total9Q = (form.nineQ || []).reduce((s,v)=>s+(v||0),0);
+
     setSaving(true);
-    setTimeout(() => {
+    try {
+      // live → RPC submitVisit; offline → mock (resolves after a short delay)
+      await LTC_API.submitVisit({ PID: patient.pid, ...form, adl_total: totalADL, nineq_total: total9Q });
       setSaving(false);
-      const totalADL = Object.values(form.adl).reduce((s,v)=>s+(v||0),0);
-      const total9Q = (form.nineQ || []).reduce((s,v)=>s+(v||0),0);
       Swal.fire({
         icon: "success",
         title: "บันทึกการเยี่ยมสำเร็จ",
@@ -3247,7 +3996,10 @@ function VisitFormScreen({ patient, onSaved, onCancel }) {
         `,
         confirmButtonText: "เสร็จสิ้น"
       }).then(() => onSaved(form));
-    }, 1100);
+    } catch (e) {
+      setSaving(false);
+      Swal.fire({ icon: "error", title: "บันทึกไม่สำเร็จ", text: e.message || String(e), confirmButtonText: "ลองใหม่" });
+    }
   };
 
   const renderStep = () => {
@@ -3416,6 +4168,12 @@ function App() {
       return <UsersScreen onBack={() => setRoute({ name: "admin" })}/>;
     case "patients":
       return <PatientsScreen onBack={() => setRoute({ name: "admin" })}/>;
+    case "assign":
+      return <AssignScreen onBack={() => setRoute({ name: "admin" })}/>;
+    case "settings":
+      return <SettingsScreen onBack={() => setRoute({ name: "admin" })}/>;
+    case "audit":
+      return <AuditLogScreen onBack={() => setRoute({ name: "admin" })}/>;
     case "cm":
       return <CaseManagerScreen
         onLogout={logout}
