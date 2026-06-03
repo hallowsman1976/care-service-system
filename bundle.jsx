@@ -126,28 +126,30 @@ const LTC_API = (() => {
     if (_mapsPromise) return _mapsPromise;
     _mapsPromise = (async () => {
       const maps = { villages: {}, villageMoo: {}, relations: {}, caregivers: {} };
-      try {
-        const ref = await rpc("getReferenceData", []);
-        const data = (ref && ref.data) || {};
-        (data.villages || []).forEach(v => {
-          const id = v.VillageID != null ? v.VillageID : v.id;
-          if (id == null || id === "") return;
-          maps.villageMoo[id] = v.MooNumber;
-          maps.villages[id] = (v.MooNumber != null && v.MooNumber !== "")
-            ? ("หมู่ " + v.MooNumber + (v.VillageName ? " " + v.VillageName : ""))
-            : (v.VillageName || String(id));
-        });
-        (data.relations || []).forEach(r => {
-          const id = r.RelationID != null ? r.RelationID : r.id;
-          if (id != null) maps.relations[id] = r.RelationName || r.name || String(id);
-        });
-      } catch (e) { /* reference data is best-effort */ }
-      try {
-        const us = await rpc("listUsers", []);   // admin-only; ignored otherwise
-        (us.users || []).forEach(u => {
-          if (String(u.Role) === "caregiver") maps.caregivers[u.UserID] = u.FullName || u.UserID;
-        });
-      } catch (e) { /* non-admin: caregiver names stay as UserIDs */ }
+      // Two independent lookups → fire in parallel (each Apps Script round trip
+      // is slow). listUsers is admin-only, so skip it entirely for non-admins
+      // instead of paying a round trip that the backend will just reject.
+      const isAdmin = (getUser() || {}).role === "admin";
+      const [refRes, usRes] = await Promise.all([
+        rpc("getReferenceData", []).catch(() => null),
+        isAdmin ? rpc("listUsers", []).catch(() => null) : Promise.resolve(null)
+      ]);
+      const data = (refRes && refRes.data) || {};
+      (data.villages || []).forEach(v => {
+        const id = v.VillageID != null ? v.VillageID : v.id;
+        if (id == null || id === "") return;
+        maps.villageMoo[id] = v.MooNumber;
+        maps.villages[id] = (v.MooNumber != null && v.MooNumber !== "")
+          ? ("หมู่ " + v.MooNumber + (v.VillageName ? " " + v.VillageName : ""))
+          : (v.VillageName || String(id));
+      });
+      (data.relations || []).forEach(r => {
+        const id = r.RelationID != null ? r.RelationID : r.id;
+        if (id != null) maps.relations[id] = r.RelationName || r.name || String(id);
+      });
+      ((usRes && usRes.users) || []).forEach(u => {
+        if (String(u.Role) === "caregiver") maps.caregivers[u.UserID] = u.FullName || u.UserID;
+      });
       return maps;
     })();
     return _mapsPromise;
@@ -232,8 +234,8 @@ const LTC_API = (() => {
 
   // Patients — server scopes by role (caregivers see only their own).
   async function listPatients(opts) {
-    const out = await rpc("listPatients", [opts || {}]);
-    const maps = await getMaps_();
+    // Patient fetch and the lookup maps are independent → run concurrently.
+    const [out, maps] = await Promise.all([rpc("listPatients", [opts || {}]), getMaps_()]);
     return (Array.isArray(out.patients) ? out.patients : []).map(r => normalizePatient(r, maps));
   }
 
