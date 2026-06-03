@@ -35,153 +35,111 @@
    ╚═══════════════════════════════════════════════════════════════════════╝ */
 
 const LTC_API = (() => {
-  const LS_URL  = "ltc_api_url";
-  const LS_USER = "ltc_user";
-
-  // Deployed Google Apps Script Web App — the system is LIVE by default.
-  // Contract:  reads  = GET  ?action=<name>          → { success, data, message }
-  //            writes = POST { action, payload }      → { success, data, message }
-  const DEFAULT_URL = "https://script.google.com/macros/s/AKfycbwAEJGrYFgQ2z3whJzkPleZUjqqeSnZP3iqt_NqqrunTPS3jRAz-9ZuHpkrlseSb9kC/exec";
+  const LS_URL   = "ltc_api_url";
+  const LS_TOKEN = "ltc_session_token";
 
   const ls = {
     get(k) { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } },
     set(k, v) { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch (e) {} }
   };
 
-  const getBaseUrl = () => ((typeof window !== "undefined" && window.LTC_API_URL) || ls.get(LS_URL) || DEFAULT_URL).trim();
+  const getBaseUrl = () => ((typeof window !== "undefined" && window.LTC_API_URL) || ls.get(LS_URL) || "").trim();
   const setBaseUrl = (url) => ls.set(LS_URL, (url || "").trim());
+  const getToken   = () => ls.get(LS_TOKEN);
+  const setToken   = (t) => ls.set(LS_TOKEN, t);
   const isLive     = () => !!getBaseUrl();
+  const delay      = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // Logged-in user, persisted across reloads.
-  const getUser = () => { try { return JSON.parse(ls.get(LS_USER) || "null"); } catch (e) { return null; } };
-  const setUser = (u) => ls.set(LS_USER, u ? JSON.stringify(u) : "");
-
-  async function parseJson_(res) {
-    try { return await res.json(); }
-    catch (e) { throw new Error("ระบบหลังบ้านตอบกลับไม่ถูกต้อง (ไม่ใช่ JSON)"); }
-  }
-
-  // Read endpoint — GET ?action=<name>&...params
-  async function apiGet(action, params) {
+  // Low-level RPC. text/plain avoids the CORS preflight that GAS can't answer.
+  async function rpc(fn, args, opts) {
     const url = getBaseUrl();
     if (!url) throw new Error("ยังไม่ได้ตั้งค่า URL ของระบบหลังบ้าน");
-    const qs = new URLSearchParams(Object.assign({ action }, params || {})).toString();
-    const res = await fetch(url + "?" + qs, { method: "GET" });
-    const data = await parseJson_(res);
-    if (!data || data.success === false) throw new Error((data && data.message) || "อ่านข้อมูลไม่สำเร็จ");
-    return data.data;
-  }
-
-  // Write endpoint — POST { action, payload } as text/plain (no CORS preflight)
-  async function apiPost(action, payload) {
-    const url = getBaseUrl();
-    if (!url) throw new Error("ยังไม่ได้ตั้งค่า URL ของระบบหลังบ้าน");
+    const token = opts && "token" in opts ? opts.token : getToken();
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ action, payload })
+      body: JSON.stringify({ fn, args: args || [], token })
     });
-    const data = await parseJson_(res);
-    if (!data || data.success === false) throw new Error((data && data.message) || "บันทึกข้อมูลไม่สำเร็จ");
-    return data.data;
+    let data;
+    try { data = await res.json(); }
+    catch (e) { throw new Error("ระบบหลังบ้านตอบกลับไม่ถูกต้อง (ไม่ใช่ JSON)"); }
+    if (!data || data.ok === false) {
+      throw new Error((data && data.message) || "เกิดข้อผิดพลาดจากระบบหลังบ้าน");
+    }
+    return data;
   }
 
-  // Backend role string → app role id used by the router.
-  function mapRole(r) {
-    const s = String(r || "").toLowerCase();
-    if (s.indexOf("admin") >= 0) return "admin";
-    if (s.indexOf("case") >= 0 || s.indexOf("manager") >= 0) return "case_manager";
-    if (s.indexOf("care") >= 0 || s.indexOf("giver") >= 0 || s.indexOf("cg") >= 0) return "caregiver";
-    return s || "caregiver";
-  }
-
-  // Birthdate is stored with a Buddhist-era year (e.g. 2487 = พ.ศ.) → age in years.
-  function ageFromBirthdate(iso) {
-    if (!iso) return null;
-    const y = new Date(iso).getFullYear();
-    if (!y || isNaN(y)) return null;
-    const nowBE = new Date().getFullYear() + 543;
-    const birthBE = y > 2400 ? y : y + 543;   // tolerate CE-stored dates too
-    const age = nowBE - birthBE;
-    return (age >= 0 && age < 130) ? age : null;
-  }
-
-  // Map a backend patient row into the shape the UI components expect.
+  // Map a server Patients row (sanitize_ of the sheet) into the frontend shape.
   function normalizePatient(r) {
-    if (!r) return r;
+    const CENTER = [16.5418, 104.7237];
+    let distance_km = null;
+    if (r.Lat && r.Lng) {
+      const dLat = (r.Lat - CENTER[0]) * 111;
+      const dLng = (r.Lng - CENTER[1]) * 111 * Math.cos(CENTER[0] * Math.PI / 180);
+      distance_km = Math.round(Math.sqrt(dLat * dLat + dLng * dLng) * 10) / 10;
+    }
     return {
-      pid: String(r.PID != null ? r.PID : (r.patient_id || "")),
-      patient_id: r.patient_id || "",
-      name: r.name || r.FullName || "—",
-      age: ageFromBirthdate(r.birthdateBE),
-      sex: r.gender || r.Sex || "",
-      village: (r.moo != null && r.moo !== "") ? ("หมู่ " + r.moo) : (r.VillageName || ""),
-      moo: r.moo,
-      address: r.address != null ? String(r.address) : "",
-      caregiver_at_home: r.caregiverName || "",
-      relation: r.relation || "",
-      contact: r.phone || "",
-      adl_group: r.adl_group || null,     // not provided by this backend
-      risk: r.risk || null,               // not provided by this backend
-      last_visit: r.lastVisit || "—",
-      visit_count: r.visitCount || 0,
-      assigned_cg: r.caregiverName || "", // backend models the caregiver as a name
-      distance_km: null,
+      pid: String(r.PID), name: r.FullName, age: r.Age, sex: r.Sex,
+      village: r.VillageName || r.VillageID || "",
+      address: r.Address, caregiver_at_home: r.HouseholdCaregiverName,
+      relation: r.HouseholdRelationID, contact: r.HouseholdContact,
+      adl_group: r.ADLGroup, risk: r.RiskLevel,
+      last_visit: r.LastVisitDate || "—", visit_count: r.VisitCount || 0,
+      assigned_cg: r.AssignedCaregiverUserID,
+      distance_km,
+      // due/visited scheduling is not yet exposed by the backend
       due_today: false, visited_today: false,
-      profileImageUrl: r.profileImageUrl || "",
-      birthdateBE: r.birthdateBE || null,
-      _raw: r
+      lat: r.Lat, lng: r.Lng
     };
   }
 
-  // ── High-level operations ─────────────────────────────────────────────────
-  async function login(username, password) {
-    const user = await apiPost("login", { username, password }); // { id, username, name, role }
-    const role = mapRole(user && user.role);
-    const merged = Object.assign({}, user, { role });
-    setUser(merged);
-    return { ok: true, user: merged, role };
+  // ── High-level calls: live → RPC, offline → mock ──────────────────────────
+  async function login(username, password, role) {
+    if (isLive()) {
+      const r = await rpc("login", [username, password, (typeof navigator !== "undefined" ? navigator.userAgent : "web")], { token: "" });
+      setToken(r.token);
+      return { ok: true, token: r.token, user: r.user, role: (r.user && r.user.Role) || role };
+    }
+    await delay(500);
+    return { ok: true, token: "mock-token", user: { ...CURRENT_USER }, role, mock: true };
   }
 
-  async function listPatients() {
-    const rows = await apiGet("listPatients");
-    return (Array.isArray(rows) ? rows : []).map(normalizePatient);
+  async function listPatients(opts) {
+    if (isLive()) {
+      const r = await rpc("listPatients", [opts || {}]);
+      return (r.patients || []).map(normalizePatient);
+    }
+    await delay(150);
+    return PATIENTS;
   }
 
-  // payload must carry patient_id (the backend's internal id)
-  async function submitVisit(payload) { return await apiPost("createVisit", payload); }
-
-  // payload must carry PID (13-digit national id)
-  async function createPatient(payload) { return await apiPost("createPatient", payload); }
-  async function updatePatient(payload) { return await apiPost("updatePatient", payload); }
-  async function deletePatient(patient_id) { return await apiPost("deletePatient", { patient_id }); }
-
-  // The backend stores the caregiver as a free-text name on the patient row.
-  async function assignCaregiver(patient_id, caregiverName) {
-    return await apiPost("updatePatient", { patient_id, caregiverName });
+  async function assignCaregiver(pid, caregiverUserId) {
+    if (isLive()) return await rpc("assignCaregiver", [pid, caregiverUserId]);
+    await delay(250);
+    return { ok: true, message: "มอบหมาย Care Giver สำเร็จ (โหมดตัวอย่าง)", mock: true };
   }
 
-  async function getSettings() { return await apiGet("getSettings"); }
-  async function saveSettings(arr) { return await apiPost("saveSettings", arr); }
+  async function submitVisit(payload) {
+    if (isLive()) return await rpc("submitVisit", [payload]);
+    await delay(900);
+    return { ok: true, mock: true };
+  }
 
-  // Connectivity check — GET ?action=ping → { success:true, message:"pong" }
+  // Connectivity check — uses doGet health endpoint.
   async function ping() {
     const url = getBaseUrl();
     if (!url) throw new Error("ยังไม่ได้ตั้งค่า URL");
-    const res = await fetch(url + "?action=ping", { method: "GET" });
-    const data = await parseJson_(res);
-    if (!data || data.success === false) throw new Error((data && data.message) || "ตอบกลับไม่ถูกต้อง");
-    return { ok: true, service: "LTC Dependence", version: "live", message: data.message };
+    const res = await fetch(url, { method: "GET" });
+    const data = await res.json();
+    if (!data || data.ok === false) throw new Error((data && data.message) || "ตอบกลับไม่ถูกต้อง");
+    return data; // { ok, service, version, time }
   }
 
-  function logout() { setUser(null); }
+  function logout() { setToken(""); }
 
   return {
-    apiGet, apiPost, login, listPatients, submitVisit,
-    createPatient, updatePatient, deletePatient, assignCaregiver,
-    getSettings, saveSettings, ping, logout,
-    getBaseUrl, setBaseUrl, getUser, setUser, isLive, normalizePatient,
-    DEFAULT_URL
+    rpc, login, listPatients, assignCaregiver, submitVisit, ping, logout,
+    getBaseUrl, setBaseUrl, getToken, setToken, isLive, normalizePatient
   };
 })();
 
@@ -198,14 +156,14 @@ if (typeof window !== "undefined") Object.assign(window, { LTC_API });
    ║   thaiDateString, thaiTimeString                                      ║
    ╚═══════════════════════════════════════════════════════════════════════╝ */
 
-// Current login (Care Giver) — name/user_id are filled from the backend on login.
+// Current login (Care Giver)
 const CURRENT_USER = {
-  user_id: "",
-  name: "เจ้าหน้าที่",
+  user_id: "CG-007",
+  name: "ขนิษฐา  ภูเวียงคำ",
   role: "Care Giver",
-  village: "—",
-  phone: "—",
-  initials: ""
+  village: "หมู่ 4 บ้านทรายไหลแล้ง",
+  phone: "081-234-5678",
+  initials: "ขภ"
 };
 
 const ALL_ROLES = [
@@ -214,9 +172,85 @@ const ALL_ROLES = [
   { id: "admin",        label: "Admin",        sub: "Dashboard · จัดการระบบ", icon: "⚙︎" }
 ];
 
-// Patient roster — loaded live from the backend (LTC_API.listPatients()).
-// No mock seed: every screen fetches the real roster.
-const PATIENTS = [];
+// Patient roster assigned to the current Care Giver
+const PATIENTS = [
+  {
+    pid: "1490800123456",
+    name: "นางบุญมี  สุขสมบัติ",
+    age: 78,
+    sex: "หญิง",
+    village: "หมู่ 4 บ้านทรายไหลแล้ง",
+    address: "บ้านเลขที่ 42/1 ม.4 ต.บ้านทรายไหลแล้ง",
+    caregiver_at_home: "นายสมพร  สุขสมบัติ",
+    relation: "บุตร",
+    contact: "0812345001",
+    adl_group: "ติดบ้าน",
+    last_visit: "21/05/2569",
+    visit_count: 6,
+    risk: "ปกติ",
+    distance_km: 1.2,
+    assigned_cg: "CG-007",      // ผู้รับผิดชอบ (Care Giver)
+    due_today: true,            // ต้องเยี่ยมวันนี้
+    visited_today: true         // เยี่ยมแล้ววันนี้
+  },
+  {
+    pid: "1490800234567",
+    name: "นายเสริม  คำมูล",
+    age: 82,
+    sex: "ชาย",
+    village: "หมู่ 4 บ้านทรายไหลแล้ง",
+    address: "บ้านเลขที่ 88 ม.4 ต.บ้านทรายไหลแล้ง",
+    caregiver_at_home: "นางวิภา  คำมูล",
+    relation: "บุตร",
+    contact: "0823456002",
+    adl_group: "ติดเตียง",
+    last_visit: "18/05/2569",
+    visit_count: 11,
+    risk: "เสี่ยงสูง",
+    distance_km: 0.6,
+    assigned_cg: "CG-007",
+    due_today: true,
+    visited_today: false
+  },
+  {
+    pid: "1490800345678",
+    name: "นางจำปา  อินทร์ทอง",
+    age: 71,
+    sex: "หญิง",
+    village: "หมู่ 5 บ้านดอนสวรรค์",
+    address: "บ้านเลขที่ 12 ม.5 ต.บ้านทรายไหลแล้ง",
+    caregiver_at_home: "นายอนุชา  อินทร์ทอง",
+    relation: "หลาน",
+    contact: "0834567003",
+    adl_group: "ติดบ้าน",
+    last_visit: "23/05/2569",
+    visit_count: 4,
+    risk: "เฝ้าระวัง",
+    distance_km: 2.4,
+    assigned_cg: "CG-007",
+    due_today: true,
+    visited_today: false
+  },
+  {
+    pid: "1490800456789",
+    name: "นายทองคำ  พิมพ์โพธิ์",
+    age: 76,
+    sex: "ชาย",
+    village: "หมู่ 4 บ้านทรายไหลแล้ง",
+    address: "บ้านเลขที่ 105 ม.4 ต.บ้านทรายไหลแล้ง",
+    caregiver_at_home: "นางสร้อย  พิมพ์โพธิ์",
+    relation: "ภรรยา",
+    contact: "0845678004",
+    adl_group: "ติดสังคม",
+    last_visit: "10/05/2569",
+    visit_count: 2,
+    risk: "ปกติ",
+    distance_km: 3.1,
+    assigned_cg: "CG-007",
+    due_today: false,
+    visited_today: false
+  }
+];
 
 const RELATIONS = ["พ่อ", "แม่", "บุตร", "พี่", "น้อง", "หลาน", "ญาติ", "อื่น ๆ"];
 
@@ -401,16 +435,29 @@ const OTHER_CARE = [
 ];
 
 // ─── Admin: Care Givers + recent Visits log ──────────────────────────
-// The backend has no caregivers endpoint — Care Givers are derived from the
-// free-text caregiverName on each patient row (see AssignScreen).
-const CAREGIVERS = [];
+const CAREGIVERS = [
+  { id: "CG-001", name: "พิมลดา  ถิรมะจิตร์",  village: "หมู่ 4", cases: 8, active: true },
+  { id: "CG-007", name: "ขนิษฐา  ภูเวียงคำ",  village: "หมู่ 4", cases: 6, active: true },
+  { id: "CG-012", name: "สมพงษ์  แก้วสีขาว",  village: "หมู่ 5", cases: 5, active: true },
+  { id: "CG-015", name: "ประภา  สิงห์ทอง",   village: "หมู่ 7", cases: 4, active: false },
+  { id: "CG-019", name: "ยุพิน  จันทร์สว่าง", village: "หมู่ 5", cases: 7, active: true }
+];
 
-// Visit history — the backend currently exposes only createVisit (write); there
-// is no list endpoint yet, so visit-derived views show honest empty states.
-const VISITS = [];
+const VISITS = [
+  { id: "V-2406", date: "24/05/2569", pid: "1490800234567", name: "นายเสริม  คำมูล",         cg: "ขนิษฐา  ภูเวียงคำ",  village: "หมู่ 4", adl: 4,  q9: 14, q8: 6,  risk: "เสี่ยงสูง" },
+  { id: "V-2405", date: "24/05/2569", pid: "1490800345678", name: "นางจำปา  อินทร์ทอง",         cg: "สมพงษ์  แก้วสีขาว",  village: "หมู่ 5", adl: 9,  q9: 8,  q8: 0,  risk: "เฝ้าระวัง" },
+  { id: "V-2404", date: "23/05/2569", pid: "1490800456789", name: "นายทองคำ  พิมพ์โพธิ์",     cg: "พิมลดา  ถิรมะจิตร์",   village: "หมู่ 4", adl: 16, q9: 4,  q8: 0,  risk: "ปกติ" },
+  { id: "V-2403", date: "23/05/2569", pid: "1490800123456", name: "นางบุญมี  สุขสมบัติ",       cg: "ขนิษฐา  ภูเวียงคำ",  village: "หมู่ 4", adl: 11, q9: 5,  q8: 0,  risk: "ปกติ" },
+  { id: "V-2402", date: "22/05/2569", pid: "1490800567890", name: "นางสมบูรณ์  ยิ้มแย้ม",     cg: "ยุพิน  จันทร์สว่าง", village: "หมู่ 5", adl: 3,  q9: 19, q8: 17, risk: "เสี่ยงสูง" },
+  { id: "V-2401", date: "22/05/2569", pid: "1490800678901", name: "นายสมพงษ์  จันทร์ผ่อง",   cg: "สมพงษ์  แก้วสีขาว",  village: "หมู่ 5", adl: 14, q9: 3,  q8: 0,  risk: "ปกติ" },
+  { id: "V-2400", date: "21/05/2569", pid: "1490800789012", name: "นางเสงี่ยม  หล้าฟ้า",       cg: "ประภา  สิงห์ทอง",    village: "หมู่ 7", adl: 7,  q9: 11, q8: 1,  risk: "เฝ้าระวัง" },
+  { id: "V-2399", date: "21/05/2569", pid: "1490800890123", name: "นายมานพ  เงินหลาย",          cg: "พิมลดา  ถิรมะจิตร์",   village: "หมู่ 4", adl: 18, q9: 2,  q8: 0,  risk: "ปกติ" },
+  { id: "V-2398", date: "20/05/2569", pid: "1490800901234", name: "นางติ๋งหลี  บุญมา",            cg: "ยุพิน  จันทร์สว่าง", village: "หมู่ 5", adl: 12, q9: 6,  q8: 0,  risk: "ปกติ" },
+  { id: "V-2397", date: "20/05/2569", pid: "1490800012345", name: "นายปิ่น  แก้วบุตร",           cg: "ขนิษฐา  ภูเวียงคำ",  village: "หมู่ 4", adl: 6,  q9: 9,  q8: 0,  risk: "เฝ้าระวัง" }
+];
 
-// 14-day visit volume — for sparkline / bar chart (empty until a visits feed exists)
-const VISITS_14D = [];
+// 14-day visit volume — for sparkline / bar chart
+const VISITS_14D = [4,3,5,6,4,2,7,8,5,6,9,7,11,8];
 
 // ─── Thai date utilities ────────────────────────────────────────────────────
 function thaiDateString(d = new Date()) {
@@ -614,118 +661,6 @@ function Toggle({ value, onChange, label, sub }) {
         />
       </span>
     </button>
-  );
-}
-
-// ─────────────────────────────────── Thai (Buddhist-era) flat date picker
-const THAI_MONTHS = ["มกราคม","กุมภาพันธ์","มีนาคม","เมษายน","พฤษภาคม","มิถุนายน","กรกฎาคม","สิงหาคม","กันยายน","ตุลาคม","พฤศจิกายน","ธันวาคม"];
-const THAI_DOW = ["อา","จ","อ","พ","พฤ","ศ","ส"];
-
-// 2-digit (or n-digit) zero pad
-function padN(n, w = 2) { return String(n).padStart(w, "0"); }
-
-// Parse a Buddhist-era date string ("2487-09-09" or "2487-09-09T...") →
-// { beYear, month(0-11), day } or null. Tolerates CE-year strings.
-function parseBE(s) {
-  if (!s) return null;
-  const m = String(s).match(/^(\d{1,4})-(\d{1,2})-(\d{1,2})/);
-  if (!m) return null;
-  let y = +m[1];
-  if (y < 2400) y += 543;            // a CE-year slipped in → convert to BE
-  return { beYear: y, month: (+m[2]) - 1, day: +m[3] };
-}
-
-// Emit the backend's birthdateBE format: BE year + UTC midnight.
-function toBEISO(beYear, month, day) {
-  return padN(beYear, 4) + "-" + padN(month + 1) + "-" + padN(day) + "T00:00:00.000Z";
-}
-
-// Age (in years) from a BE-year birthdate string, or "" if unknown.
-function ageFromBE(s) {
-  const p = parseBE(s);
-  if (!p) return "";
-  const nowBE = new Date().getFullYear() + 543;
-  const a = nowBE - p.beYear;
-  return (a >= 0 && a < 130) ? a : "";
-}
-
-function ThaiDatePicker({ value, onChange, placeholder = "เลือกวันเกิด" }) {
-  const sel = parseBE(value);
-  const nowBE = new Date().getFullYear() + 543;
-  const [open, setOpen] = useState(false);
-  const [viewY, setViewY] = useState(sel ? sel.beYear : nowBE - 70);
-  const [viewM, setViewM] = useState(sel ? sel.month : 0);
-
-  // Re-sync the calendar view when an external value arrives.
-  useEffect(() => {
-    const s = parseBE(value);
-    if (s) { setViewY(s.beYear); setViewM(s.month); }
-  }, [value]);
-
-  // Calendar math uses the Gregorian year so leap days / weekdays are correct.
-  const gy = viewY - 543;
-  const daysInMonth = new Date(gy, viewM + 1, 0).getDate();
-  const firstDow = new Date(gy, viewM, 1).getDay();
-  const cells = [];
-  for (let i = 0; i < firstDow; i++) cells.push(null);
-  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
-
-  const years = [];
-  for (let y = nowBE; y >= nowBE - 120; y--) years.push(y);
-
-  const prevMonth = () => { if (viewM === 0) { setViewM(11); setViewY(viewY - 1); } else setViewM(viewM - 1); };
-  const nextMonth = () => { if (viewM === 11) { setViewM(0); setViewY(viewY + 1); } else setViewM(viewM + 1); };
-  const pick = (d) => { onChange(toBEISO(viewY, viewM, d)); setOpen(false); };
-
-  const label = sel ? `${sel.day} ${THAI_MONTHS[sel.month]} ${sel.beYear}` : "";
-
-  return (
-    <div className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen(o => !o)}
-        className="w-full h-12 px-4 rounded-xl bg-white border border-ink-200 text-left text-[15px] flex items-center justify-between outline-none focus:border-ink-700 focus:shadow-ring transition"
-      >
-        <span className={label ? "text-ink-900 tnum" : "text-ink-400"}>{label || placeholder}</span>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="text-ink-500"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
-      </button>
-
-      {open ? (
-        <div className="mt-2 rounded-2xl bg-white border border-ink-200 shadow-card p-3">
-          <div className="flex items-center gap-2 mb-2">
-            <button type="button" onClick={prevMonth} className="w-8 h-8 grid place-items-center rounded-lg bg-ink-50 text-ink-700 active:scale-95">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 18l-6-6 6-6"/></svg>
-            </button>
-            <select value={viewM} onChange={e => setViewM(+e.target.value)} className="flex-1 h-9 px-2 rounded-lg border border-ink-200 text-[13px] bg-white outline-none focus:border-ink-700">
-              {THAI_MONTHS.map((m, i) => <option key={i} value={i}>{m}</option>)}
-            </select>
-            <select value={viewY} onChange={e => setViewY(+e.target.value)} className="w-[88px] h-9 px-2 rounded-lg border border-ink-200 text-[13px] bg-white outline-none focus:border-ink-700 tnum">
-              {years.map(y => <option key={y} value={y}>{y}</option>)}
-            </select>
-            <button type="button" onClick={nextMonth} className="w-8 h-8 grid place-items-center rounded-lg bg-ink-50 text-ink-700 active:scale-95">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 6l6 6-6 6"/></svg>
-            </button>
-          </div>
-          <div className="grid grid-cols-7 gap-1 mb-1">
-            {THAI_DOW.map((d, i) => <div key={i} className="text-center text-[11px] text-ink-400">{d}</div>)}
-          </div>
-          <div className="grid grid-cols-7 gap-1">
-            {cells.map((d, i) => {
-              if (!d) return <div key={i}></div>;
-              const on = sel && sel.beYear === viewY && sel.month === viewM && sel.day === d;
-              return (
-                <button
-                  key={i}
-                  type="button"
-                  onClick={() => pick(d)}
-                  className={"h-9 rounded-lg text-[13px] tnum transition " + (on ? "bg-ink-800 text-white" : "text-ink-800 hover:bg-ink-50 active:bg-ink-100")}
-                >{d}</button>
-              );
-            })}
-          </div>
-        </div>
-      ) : null}
-    </div>
   );
 }
 
@@ -941,8 +876,8 @@ const { useState: uS1, useEffect: uE1 } = React;
 // ──────────────────────────────────────────────────────────────── LOGIN
 function LoginScreen({ onLogin }) {
   const [role, setRole] = uS1("caregiver");
-  const [username, setUsername] = uS1("");
-  const [password, setPassword] = uS1("");
+  const [username, setUsername] = uS1("caregiver01");
+  const [password, setPassword] = uS1("••••••");
   const [show, setShow] = uS1(false);
   const [loading, setLoading] = uS1(false);
 
@@ -953,12 +888,7 @@ function LoginScreen({ onLogin }) {
     }
     setLoading(true);
     try {
-      const r = await LTC_API.login(username, password);
-      // Reflect the real signed-in identity in the header of each role's home.
-      const u = r.user || {};
-      if (r.role === "admin")        { ADMIN_USER.name = u.name || ADMIN_USER.name; }
-      else if (r.role === "case_manager") { CM_USER.name = u.name || CM_USER.name; }
-      else { CURRENT_USER.name = u.name || CURRENT_USER.name; CURRENT_USER.user_id = u.id != null ? String(u.id) : CURRENT_USER.user_id; }
+      const r = await LTC_API.login(username, password, role);
       setLoading(false);
       onLogin(r.role || role);
     } catch (e) {
@@ -1457,20 +1387,18 @@ function PatientCard({ p, onOpen }) {
           <div className="text-[11.5px] text-ink-500 tnum mt-0.5">PID {p.pid}</div>
           <div className="text-[12px] text-ink-600 mt-1.5 truncate">{p.village}</div>
           <div className="mt-2 flex flex-wrap items-center gap-1.5">
-            {p.adl_group ? <ScoreChip tone={adlTone}>{p.adl_group}</ScoreChip> : null}
-            {p.risk ? <ScoreChip tone={riskTone}>{p.risk}</ScoreChip> : null}
+            <ScoreChip tone={adlTone}>{p.adl_group}</ScoreChip>
+            <ScoreChip tone={riskTone}>{p.risk}</ScoreChip>
             <span className="text-[11px] text-ink-500 ml-auto tnum">เยี่ยมล่าสุด {p.last_visit}</span>
           </div>
         </div>
       </div>
       <div className="dotted-rule my-3"></div>
       <div className="flex items-center justify-between text-[12px] text-ink-600">
-        {p.distance_km != null ? (
-          <span className="inline-flex items-center gap-1.5 tnum">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 10c0 7-9 13-9 13S3 17 3 10a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
-            ห่าง {p.distance_km} กม.
-          </span>
-        ) : <span></span>}
+        <span className="inline-flex items-center gap-1.5 tnum">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 10c0 7-9 13-9 13S3 17 3 10a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+          ห่าง {p.distance_km} กม.
+        </span>
         <span className="tnum">เยี่ยมรวม {p.visit_count} ครั้ง</span>
         <span className="inline-flex items-center gap-1 text-ink-800 font-medium">
           เปิดเคส
@@ -1494,9 +1422,9 @@ Object.assign(window, { LoginScreen, HomeScreen, PatientCard });
 const { useState: usD, useMemo: umD, useRef: urD } = React;
 
 const ADMIN_USER = {
-  name: "ผู้ดูแลระบบ",
+  name: "นพ.ธีรพงศ์  ภูวสิน",
   role: "ผู้อำนวยการ รพ.สต.",
-  initials: ""
+  initials: "ธภ"
 };
 
 function AdminDashboard({ onLogout, onNav }) {
@@ -1504,42 +1432,19 @@ function AdminDashboard({ onLogout, onNav }) {
   const [query, setQuery] = usD("");
   const [riskFilter, setRiskFilter] = usD("all");
   const [village, setVillage] = usD("all");
-  const [patients, setPatients] = usD([]);
 
-  // Live patient roster from the backend (listPatients).
-  useEffect(() => {
-    let alive = true;
-    LTC_API.listPatients()
-      .then(list => { if (alive && Array.isArray(list)) setPatients(list); })
-      .catch(() => {});
-    return () => { alive = false; };
-  }, []);
-
-  // ─── KPIs ────────────────────────────────────────────────────────────────
-  // cases = live roster size; visit-derived figures depend on a visits-read
-  // endpoint the backend does not expose yet, so they stay at 0 (honest).
+  // ─── KPIs derived from VISITS + PATIENTS ─────────────────────────────────
   const k = umD(() => {
-    const cases = patients.length;
-    const visits = VISITS.length;
+    const cases = PATIENTS.length;                // roster size (from data)
+    const visits = VISITS.length;                 // total visits to-date (from data)
     const lowADL = VISITS.filter(v => v.adl <= 11).length;
     const high9Q = VISITS.filter(v => v.q9 >= 7).length;
     const has8Q = VISITS.filter(v => v.q8 > 0).length;
+    // VISITS is ordered newest-first; count visits on the latest recorded day
     const latestDate = VISITS.length ? VISITS[0].date : null;
     const visitsToday = latestDate ? VISITS.filter(v => v.date === latestDate).length : 0;
     return { cases, visits, lowADL, high9Q, has8Q, visitsToday };
-  }, [patients]);
-
-  // Care Givers derived from the live roster (backend has no caregivers feed).
-  const caregivers = umD(() => {
-    const m = {};
-    patients.forEach(p => {
-      const n = p.assigned_cg;
-      if (!n) return;
-      if (!m[n]) m[n] = { id: n, name: n, village: p.village || "", cases: 0, active: true };
-      m[n].cases++;
-    });
-    return Object.values(m).sort((a, b) => b.cases - a.cases);
-  }, [patients]);
+  }, []);
 
   // ─── Filtered visits ─────────────────────────────────────────────────────
   const filtered = umD(() => VISITS.filter(v => {
@@ -1660,7 +1565,7 @@ function AdminDashboard({ onLogout, onNav }) {
           <span className="inline-flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-sm bg-accent-coral"></span> เคสเสี่ยง
           </span>
-          <span className="tnum">เฉลี่ย {VISITS_14D.length ? (VISITS_14D.reduce((s,v)=>s+v,0)/VISITS_14D.length).toFixed(1) : "0"} ครั้ง/วัน</span>
+          <span className="tnum">เฉลี่ย 6.1 ครั้ง/วัน</span>
         </div>
       </SectionCard>
 
@@ -1669,23 +1574,23 @@ function AdminDashboard({ onLogout, onNav }) {
       {/* ADL distribution donut */}
       <div className="px-5 grid grid-cols-1 gap-4">
         <SectionCard title="การกระจายระดับการพึ่งพิง" subtitle="จากการประเมิน ADL ล่าสุด">
-          <ADLDonut patients={patients}/>
+          <ADLDonut/>
         </SectionCard>
       </div>
 
       <div className="h-4"></div>
 
       {/* Care giver leaderboard */}
-      <SectionCard title="Care Giver ในพื้นที่" subtitle={`${caregivers.length} คนปฏิบัติงาน`}>
+      <SectionCard title="Care Giver ในพื้นที่" subtitle={`${CAREGIVERS.filter(c=>c.active).length} คนปฏิบัติงาน`}>
         <div className="space-y-2">
-          {caregivers.map((c,i) => (
+          {CAREGIVERS.map((c,i) => (
             <div key={c.id} className="flex items-center gap-3 py-2">
               <div className="w-9 h-9 rounded-xl bg-paper border border-ink-100 grid place-items-center text-[12px] font-medium text-ink-700">
                 {c.name.split(" ").filter(Boolean)[0].slice(0,2)}
               </div>
               <div className="flex-1 min-w-0">
                 <div className="text-[13.5px] text-ink-900 truncate">{c.name}</div>
-                <div className="text-[11.5px] text-ink-500">{c.village}</div>
+                <div className="text-[11.5px] text-ink-500">{c.id} · {c.village}</div>
               </div>
               <div className="text-right">
                 <div className="text-[13px] font-medium text-ink-900 tnum">{c.cases}</div>
@@ -1694,11 +1599,6 @@ function AdminDashboard({ onLogout, onNav }) {
               <span className={"w-2 h-2 rounded-full " + (c.active ? "bg-accent-sage" : "bg-ink-300")}></span>
             </div>
           ))}
-          {caregivers.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-ink-200 p-6 text-center text-ink-500 text-[12.5px]">
-              ยังไม่มี Care Giver ที่ถูกมอบหมาย
-            </div>
-          ) : null}
         </div>
       </SectionCard>
 
@@ -1800,7 +1700,7 @@ function AdminDashboard({ onLogout, onNav }) {
         </button>
 
         <div className="grid grid-cols-2 gap-3">
-          <AdminAction icon="users"    label="จัดการผู้ใช้งาน" sub={`${caregivers.length} คน`}     onClick={() => onNav?.("users")}/>
+          <AdminAction icon="users"    label="จัดการผู้ใช้งาน" sub={`${CAREGIVERS.length} คน`}     onClick={() => onNav?.("users")}/>
           <AdminAction icon="patients" label="ทะเบียนผู้สูงอายุ" sub={`${k.cases} เคส`}        onClick={() => onNav?.("patients")}/>
           <AdminAction icon="settings" label="ตั้งค่าระบบ"     sub="ฟอร์ม · พื้นที่"        onClick={() => onNav?.("settings")}/>
           <AdminAction icon="audit"    label="audit log"        sub="กิจกรรมการแก้ไข"      onClick={() => onNav?.("audit")}/>
@@ -1841,14 +1741,7 @@ function KPI({ value, label, sub, tone = "neutral", trend }) {
 
 // ────────────────────────────────────────────────────────────── Bar chart
 function VisitsBarChart({ data }) {
-  if (!data || data.length === 0) {
-    return (
-      <div className="h-32 grid place-items-center text-[12px] text-ink-400">
-        ยังไม่มีข้อมูลการเยี่ยม
-      </div>
-    );
-  }
-  const max = Math.max(...data) || 1;
+  const max = Math.max(...data);
   const labels = ["จ","อ","พ","พฤ","ศ","ส","อา"];
   return (
     <div>
@@ -1878,20 +1771,13 @@ function VisitsBarChart({ data }) {
 }
 
 // ────────────────────────────────────────────────────────────── ADL donut
-function ADLDonut({ patients = [] }) {
+function ADLDonut() {
   const seg = [
-    { label: "ติดสังคม", value: patients.filter(p => p.adl_group === "ติดสังคม").length, color: "#3e8e6a" },
-    { label: "ติดบ้าน",   value: patients.filter(p => p.adl_group === "ติดบ้าน").length,  color: "#b58a3c" },
-    { label: "ติดเตียง",  value: patients.filter(p => p.adl_group === "ติดเตียง").length, color: "#c0533f" }
+    { label: "ติดสังคม", value: 18, color: "#3e8e6a" },
+    { label: "ติดบ้าน",   value: 9,  color: "#b58a3c" },
+    { label: "ติดเตียง",  value: 5,  color: "#c0533f" }
   ];
   const total = seg.reduce((s,x)=>s+x.value, 0);
-  if (total === 0) {
-    return (
-      <div className="h-28 grid place-items-center text-[12px] text-ink-400 text-center">
-        ยังไม่มีข้อมูลการประเมิน ADL
-      </div>
-    );
-  }
   let acc = 0;
   const R = 42, C = 2 * Math.PI * R;
   return (
@@ -2005,10 +1891,29 @@ const ROLE_BADGE = {
   "Case Manager": { tone: "warning", label: "Case Manager" }
 };
 
-// The backend exposes no users endpoint, so user management starts empty
-// (local-only editor). No mock accounts are seeded.
+// Seed an editable list from data.jsx CAREGIVERS + a couple admin/CM accounts.
 function seedUsers() {
-  return [];
+  const cgs = (CAREGIVERS || []).map(c => ({
+    user_id: c.id,
+    name: c.name,
+    role: "Care Giver",
+    username: c.id.toLowerCase().replace("-",""),
+    village: c.village,
+    phone: "08" + Math.floor(10000000 + Math.random()*89999999),
+    cases: c.cases,
+    active: c.active
+  }));
+  return [
+    {
+      user_id: "AD-001", name: "นพ.ธีรพงศ์  ภูวสิน", role: "Admin",
+      username: "admin01", village: "—", phone: "0851112233", cases: 0, active: true
+    },
+    {
+      user_id: "CM-001", name: "พญ.สุนิสา  วรกิจ", role: "Case Manager",
+      username: "cm01", village: "—", phone: "0852223344", cases: 0, active: true
+    },
+    ...cgs
+  ];
 }
 
 // ────────────────────────────────────────────────────────────── Bottom Sheet
@@ -2268,28 +2173,14 @@ function UserEditor({ user, onSave, onDelete, onClose }) {
 
 // ─────────────────────────────────────────────────────────── Patient Registry
 function PatientsScreen({ onBack }) {
-  const [list, setList] = usM([]);
+  const [list, setList] = usM(() => [...(PATIENTS||[]),
+    // a couple more rows so the registry feels populated
+    { pid:"1490800555111", name:"นางวรรณี  ศรีสุวรรณ", age:69, sex:"หญิง", village:"หมู่ 5 บ้านดอนสวรรค์", address:"55 ม.5", caregiver_at_home:"นายเอก  ศรีสุวรรณ", relation:"บุตร", contact:"0856667777", adl_group:"ติดสังคม", last_visit:"19/05/2569", visit_count:3, risk:"ปกติ", distance_km:1.8 },
+    { pid:"1490800666222", name:"นายสุพจน์  จันทร์ฉาย", age:80, sex:"ชาย", village:"หมู่ 7 บ้านโนนหินดำ", address:"7/2 ม.7", caregiver_at_home:"นางคำพา  จันทร์ฉาย", relation:"ภรรยา", contact:"0867778888", adl_group:"ติดเตียง", last_visit:"15/05/2569", visit_count:9, risk:"เสี่ยงสูง", distance_km:4.5 }
+  ]);
   const [q, setQ] = usM("");
   const [grp, setGrp] = usM("all");
   const [editing, setEditing] = usM(null);
-
-  const reload = () => LTC_API.listPatients()
-    .then(rows => { if (Array.isArray(rows)) setList(rows); })
-    .catch(() => {});
-  ueM(() => { reload(); }, []);
-
-  // Map the editor's (app-shaped) record to the backend patient payload.
-  const toBackend = (p) => ({
-    patient_id: p.patient_id || undefined,
-    PID: p.pid,
-    name: p.name,
-    gender: p.sex,
-    moo: (String(p.village).match(/\d+/) || [""])[0],
-    address: p.address,
-    phone: p.contact,
-    caregiverName: p.caregiver_at_home,
-    birthdateBE: p.birthdateBE || undefined
-  });
 
   const filtered = umM(() => list.filter(p => {
     if (grp !== "all" && p.adl_group !== grp) return false;
@@ -2313,7 +2204,7 @@ function PatientsScreen({ onBack }) {
     adl_group:"ติดบ้าน", last_visit:"—", visit_count:0, risk:"ปกติ", distance_km:1
   });
 
-  const save = async (next) => {
+  const save = (next) => {
     if (!/^\d{13}$/.test(next.pid)) {
       Swal.fire({ icon: "warning", title: "PID ไม่ถูกต้อง", text: "ต้องเป็นตัวเลข 13 หลัก" });
       return;
@@ -2326,31 +2217,21 @@ function PatientsScreen({ onBack }) {
       Swal.fire({ icon: "warning", title: "เบอร์ไม่ถูกต้อง", text: "ต้องเป็นตัวเลข 9-10 หลัก" });
       return;
     }
-    const exists = !!next.patient_id;
-    try {
-      if (exists) await LTC_API.updatePatient(toBackend(next));
-      else        await LTC_API.createPatient(toBackend(next));
-      await reload();
-      setEditing(null);
-      Swal.fire({ icon: "success", title: exists ? "อัปเดตสำเร็จ" : "เพิ่มผู้สูงอายุสำเร็จ", timer: 1100, showConfirmButton: false });
-    } catch (e) {
-      Swal.fire({ icon: "error", title: "บันทึกไม่สำเร็จ", text: e.message || String(e) });
-    }
+    const exists = list.some(p => p.pid === next.pid);
+    setList(exists ? list.map(p => p.pid === next.pid ? next : p) : [next, ...list]);
+    setEditing(null);
+    Swal.fire({ icon: "success", title: exists ? "อัปเดตสำเร็จ" : "เพิ่มผู้สูงอายุสำเร็จ", timer: 1100, showConfirmButton: false });
   };
 
   const remove = (p) => {
     Swal.fire({
       icon: "warning", title: "ลบเคส?", html: `<b>${p.name}</b><br/>PID ${p.pid}`,
       showCancelButton: true, confirmButtonText: "ลบ", cancelButtonText: "ยกเลิก"
-    }).then(async r => {
-      if (!r.isConfirmed) return;
-      try {
-        await LTC_API.deletePatient(p.patient_id);
-        await reload();
+    }).then(r => {
+      if (r.isConfirmed) {
+        setList(list.filter(x => x.pid !== p.pid));
         setEditing(null);
         Swal.fire({ icon: "success", title: "ลบแล้ว", timer: 900, showConfirmButton: false });
-      } catch (e) {
-        Swal.fire({ icon: "error", title: "ลบไม่สำเร็จ", text: e.message || String(e) });
       }
     });
   };
@@ -2416,8 +2297,8 @@ function PatientsScreen({ onBack }) {
                 <div className="text-[11px] text-ink-500 tnum">PID {p.pid}</div>
                 <div className="text-[12px] text-ink-600 mt-1 truncate">{p.village}</div>
                 <div className="mt-2 flex items-center gap-1.5">
-                  {p.adl_group ? <ScoreChip tone={p.adl_group==="ติดเตียง"?"danger":p.adl_group==="ติดบ้าน"?"warning":"ok"}>{p.adl_group}</ScoreChip> : null}
-                  {p.risk ? <ScoreChip tone={p.risk==="เสี่ยงสูง"?"danger":p.risk==="เฝ้าระวัง"?"warning":"ok"}>{p.risk}</ScoreChip> : null}
+                  <ScoreChip tone={p.adl_group==="ติดเตียง"?"danger":p.adl_group==="ติดบ้าน"?"warning":"ok"}>{p.adl_group}</ScoreChip>
+                  <ScoreChip tone={p.risk==="เสี่ยงสูง"?"danger":p.risk==="เฝ้าระวัง"?"warning":"ok"}>{p.risk}</ScoreChip>
                   <span className="ml-auto text-[11px] text-ink-500 tnum">{p.visit_count} ครั้ง</span>
                 </div>
               </div>
@@ -2478,12 +2359,9 @@ function PatientEditor({ patient, onSave, onDelete, onClose }) {
       <Field label="ชื่อ - นามสกุล" required>
         <TextInput value={d.name} onChange={e => set({ name: e.target.value })} placeholder="เช่น นางบุญมี  สุขสมบัติ"/>
       </Field>
-      <Field label="วันเดือนปีเกิด (พ.ศ.)" hint="เลือกจากปฏิทิน">
-        <ThaiDatePicker value={d.birthdateBE} onChange={iso => set({ birthdateBE: iso })}/>
-      </Field>
       <div className="grid grid-cols-2 gap-3">
-        <Field label="อายุ" hint="คำนวณจากวันเกิด">
-          <TextInput value={ageFromBE(d.birthdateBE)} readOnly inputMode="numeric" suffix="ปี" placeholder="—"/>
+        <Field label="อายุ" required>
+          <TextInput value={d.age} onChange={e => set({ age: e.target.value.replace(/[^\d]/g,"") })} inputMode="numeric" suffix="ปี"/>
         </Field>
         <Field label="เพศ">
           <Select
@@ -2527,6 +2405,15 @@ function PatientEditor({ patient, onSave, onDelete, onClose }) {
         </Field>
       </div>
       <div className="dotted-rule"></div>
+      <Field label="ผู้รับผิดชอบ (Care Giver)" hint="เจ้าหน้าที่ผู้บันทึกการเยี่ยมในระบบ">
+        <Select
+          value={d.assigned_cg}
+          onChange={e => set({ assigned_cg: e.target.value })}
+          placeholder="ยังไม่มอบหมาย"
+          options={CAREGIVERS.filter(c => c.active).map(c => ({ value: c.id, label: `${c.name} · ${c.village}` }))}
+        />
+      </Field>
+      <div className="dotted-rule"></div>
       <div className="grid grid-cols-2 gap-3">
         <Field label="ระดับการพึ่งพิง">
           <Select value={d.adl_group} onChange={e => set({ adl_group: e.target.value })} options={["ติดสังคม","ติดบ้าน","ติดเตียง"]}/>
@@ -2541,65 +2428,55 @@ function PatientEditor({ patient, onSave, onDelete, onClose }) {
 
 // ─────────────────────────────────────────────── Assign Care Giver (Admin)
 function AssignScreen({ onBack }) {
-  const [list, setList] = usM([]);
+  const [list, setList] = usM(() => (PATIENTS || []).map(p => ({ ...p })));
   const [q, setQ] = usM("");
   const [picking, setPicking] = usM(null); // patient currently being (re)assigned
 
-  // Load the full roster from the backend (admin sees all).
+  // Load the full roster from the backend when configured (admin sees all).
   ueM(() => {
     let alive = true;
-    LTC_API.listPatients().then(rows => {
-      if (alive && Array.isArray(rows)) setList(rows);
-    }).catch(() => {});
+    if (LTC_API.isLive()) {
+      LTC_API.listPatients({}).then(rows => {
+        if (alive && Array.isArray(rows)) setList(rows);
+      }).catch(() => {});
+    }
     return () => { alive = false; };
   }, []);
 
-  // The backend models the Care Giver as a free-text name stored on each patient
-  // row (there is no caregivers table/endpoint), so the available options are the
-  // distinct names already present across the roster.
-  const cgNames = umM(() => {
-    const s = new Set();
-    list.forEach(p => { if (p.assigned_cg) s.add(p.assigned_cg); });
-    return Array.from(s).sort();
-  }, [list]);
+  const cgById = umM(() => {
+    const m = {};
+    CAREGIVERS.forEach(c => { m[c.id] = c; });
+    return m;
+  }, []);
 
   const filtered = umM(() => list.filter(p => {
     if (!q) return true;
     const n = q.toLowerCase();
-    return (p.name + p.pid + p.village + (p.assigned_cg || "")).toLowerCase().includes(n);
-  }), [list, q]);
+    const cgName = (cgById[p.assigned_cg] && cgById[p.assigned_cg].name) || "";
+    return (p.name + p.pid + p.village + cgName).toLowerCase().includes(n);
+  }), [list, q, cgById]);
 
   const assignedCount = umM(() => list.filter(p => p.assigned_cg).length, [list]);
   const unassignedCount = list.length - assignedCount;
 
-  const apply = async (patient_id, caregiverName) => {
+  const apply = async (pid, cgId) => {
+    const name = cgId ? (cgById[cgId] && cgById[cgId].name) || cgId : null;
     try {
-      // assignCaregiver(patient_id, caregiverName) → POST updatePatient (admin-only).
-      if (caregiverName) await LTC_API.assignCaregiver(patient_id, caregiverName);
-      setList(list.map(p => (p.patient_id === patient_id || p.pid === patient_id)
-        ? { ...p, assigned_cg: caregiverName, caregiver_at_home: caregiverName } : p));
+      // Persist to the backend (assignCaregiver is admin-only and validates the
+      // Care Giver). The backend has no "unassign" endpoint, so clearing an
+      // assignment stays client-side for now.
+      if (cgId) await LTC_API.assignCaregiver(pid, cgId);
+      setList(list.map(p => p.pid === pid ? { ...p, assigned_cg: cgId } : p));
       setPicking(null);
       Swal.fire({
         icon: "success",
-        title: "มอบหมายสำเร็จ",
-        html: `มอบหมายให้ <b>${caregiverName}</b>`,
+        title: cgId ? "มอบหมายสำเร็จ" : "ยกเลิกการมอบหมายแล้ว",
+        html: cgId ? `มอบหมายให้ <b>${name}</b>` : undefined,
         timer: 1200, showConfirmButton: false
       });
     } catch (e) {
       Swal.fire({ icon: "error", title: "มอบหมายไม่สำเร็จ", text: e.message || String(e) });
     }
-  };
-
-  const promptNewName = (patient_id) => {
-    Swal.fire({
-      title: "ระบุชื่อ Care Giver",
-      input: "text",
-      inputPlaceholder: "เช่น นางสมจิตร ใจดี",
-      showCancelButton: true,
-      confirmButtonText: "มอบหมาย",
-      cancelButtonText: "ยกเลิก",
-      inputValidator: (v) => (!v || !v.trim()) ? "กรุณาระบุชื่อ" : undefined
-    }).then(r => { if (r.isConfirmed && r.value) apply(patient_id, r.value.trim()); });
   };
 
   return (
@@ -2632,7 +2509,7 @@ function AssignScreen({ onBack }) {
       {/* List */}
       <div className="px-5 space-y-3">
         {filtered.map(p => {
-          const cg = p.assigned_cg;
+          const cg = cgById[p.assigned_cg];
           return (
             <div key={p.pid} className="rounded-3xl bg-white border border-ink-100 shadow-card p-4">
               <div className="flex items-start gap-3">
@@ -2645,7 +2522,7 @@ function AssignScreen({ onBack }) {
                   <div className="mt-2">
                     {cg ? (
                       <span className="inline-flex items-center gap-1.5 text-[12px] text-ink-700">
-                        <span className="w-1.5 h-1.5 rounded-full bg-accent-sage"></span>{cg}
+                        <span className="w-1.5 h-1.5 rounded-full bg-accent-sage"></span>{cg.name}
                       </span>
                     ) : (
                       <span className="inline-flex items-center gap-1.5 text-[12px] text-accent-coral">
@@ -2675,28 +2552,31 @@ function AssignScreen({ onBack }) {
       >
         {picking ? (
           <div className="space-y-2">
-            {cgNames.map(name => {
-              const on = picking.assigned_cg === name;
+            {CAREGIVERS.filter(c => c.active).map(c => {
+              const on = picking.assigned_cg === c.id;
               return (
                 <button
-                  key={name}
-                  onClick={() => apply(picking.patient_id || picking.pid, name)}
+                  key={c.id}
+                  onClick={() => apply(picking.pid, c.id)}
                   className={"w-full text-left rounded-2xl border p-3.5 flex items-center gap-3 transition " + (on ? "radio-card-on" : "border-ink-200 bg-white")}
                 >
                   <div className="w-10 h-10 rounded-xl bg-paper grid place-items-center font-medium text-ink-700">
-                    {name.replace(/^น(าง|าย|.ส.)\s*/,"").slice(0,2)}
+                    {c.name.replace(/^น(าง|าย|.ส.)\s*/,"").slice(0,2)}
                   </div>
                   <div className="flex-1 min-w-0">
-                    <div className="text-[14px] font-medium text-ink-900 truncate">{name}</div>
+                    <div className="text-[14px] font-medium text-ink-900 truncate">{c.name}</div>
+                    <div className="text-[11.5px] text-ink-500">{c.village} · ดูแล {c.cases} เคส</div>
                   </div>
                   {on ? <span className="text-[11px] text-ink-700 shrink-0">ปัจจุบัน</span> : null}
                 </button>
               );
             })}
-            <button
-              onClick={() => promptNewName(picking.patient_id || picking.pid)}
-              className="w-full text-center rounded-2xl border border-ink-200 text-ink-700 p-3 text-[13px]"
-            >+ พิมพ์ชื่อ Care Giver ใหม่</button>
+            {picking.assigned_cg ? (
+              <button
+                onClick={() => apply(picking.pid, "")}
+                className="w-full text-center rounded-2xl border border-accent-coral/30 text-accent-coral p-3 text-[13px]"
+              >ยกเลิกการมอบหมาย</button>
+            ) : null}
           </div>
         ) : null}
       </BottomSheet>
@@ -2838,8 +2718,14 @@ function SettingsScreen({ onBack }) {
 }
 
 // ─────────────────────────────────────────────────────────── Audit Log (Admin)
-// The backend exposes no audit-log endpoint yet → empty until one exists.
-const AUDIT_LOG = [];
+const AUDIT_LOG = [
+  { id: "A-9001", ts: "03/06/2569 09:14", actor: "นพ.ธีรพงศ์  ภูวสิน", action: "assign_caregiver", target: "นางบุญมี  สุขสมบัติ", detail: "มอบหมายให้ ขนิษฐา  ภูเวียงคำ", tone: "neutral" },
+  { id: "A-9000", ts: "03/06/2569 08:52", actor: "ขนิษฐา  ภูเวียงคำ",  action: "submit_visit",     target: "นายเสริม  คำมูล",       detail: "บันทึกการเยี่ยม · ADL 4 · 8Q 6", tone: "warning" },
+  { id: "A-8999", ts: "02/06/2569 16:30", actor: "นพ.ธีรพงศ์  ภูวสิน", action: "create_user",       target: "ยุพิน  จันทร์สว่าง",     detail: "เพิ่มผู้ใช้ใหม่ · บทบาท Care Giver", tone: "ok" },
+  { id: "A-8998", ts: "02/06/2569 14:05", actor: "สมพงษ์  แก้วสีขาว",  action: "update_patient",    target: "นางจำปา  อินทร์ทอง",      detail: "แก้ไขระดับความเสี่ยง → เฝ้าระวัง", tone: "neutral" },
+  { id: "A-8997", ts: "02/06/2569 10:41", actor: "นพ.ธีรพงศ์  ภูวสิน", action: "reset_password",    target: "ประภา  สิงห์ทอง",       detail: "รีเซ็ตรหัสผ่าน", tone: "warning" },
+  { id: "A-8996", ts: "01/06/2569 09:00", actor: "ระบบ",              action: "login",             target: "ขนิษฐา  ภูเวียงคำ",     detail: "เข้าสู่ระบบสำเร็จ", tone: "ok" }
+];
 const AUDIT_LABELS = {
   assign_caregiver: "มอบหมาย Care Giver",
   submit_visit: "บันทึกการเยี่ยม",
@@ -2911,9 +2797,9 @@ Object.assign(window, { UsersScreen, PatientsScreen, BottomSheet, AssignScreen, 
 const { useState: usC, useMemo: umC, useRef: urC, useEffect: ueC } = React;
 
 const CM_USER = {
-  name: "Case Manager",
+  name: "พญ.สุนิสา  วรกิจ",
   role: "Case Manager",
-  initials: ""
+  initials: "สว"
 };
 
 // ─── Seed: build cases from VISITS, grouped by PID ──────────────────────────
@@ -2948,8 +2834,18 @@ function buildCases() {
   return cases;
 }
 
-// Comment threads keyed by PID — no backend feed yet, so none are seeded.
-const SEED_COMMENTS = {};
+// Seed comment threads keyed by PID
+const SEED_COMMENTS = {
+  "1490800234567": [
+    { author: "พญ.สุนิสา  วรกิจ", role: "Case Manager", time: "24/05/2569 14:32", text: "ผลประเมิน 9Q เพิ่มขึ้น 4 คะแนนใน 2 สัปดาห์ — ขอให้ Care Giver ติดตามภายใน 3 วัน และส่งผลให้ทีมจิตเวช รพ.อำเภอ" },
+    { author: "ขนิษฐา  ภูเวียงคำ", role: "Care Giver",   time: "24/05/2569 16:10", text: "รับทราบค่ะ จะเข้าเยี่ยมพรุ่งนี้เช้า พร้อมประเมินสภาพจิตซ้ำและประสานญาติ" }
+  ],
+  "1490800567890": [
+    { author: "พญ.สุนิสา  วรกิจ", role: "Case Manager", time: "22/05/2569 09:15", text: "8Q = 17 — ส่งต่อ รพ.มุกดาหาร แผนกจิตเวชโดยด่วน · เปิด refer note และจัดรถพยาบาล" },
+    { author: "ยุพิน  จันทร์สว่าง", role: "Care Giver", time: "22/05/2569 10:42", text: "ประสาน รพ.มุกดาหารแล้ว รับเคสไป admit เรียบร้อย กำหนดติดตาม 1 สัปดาห์" },
+    { author: "พญ.สุนิสา  วรกิจ", role: "Case Manager", time: "23/05/2569 08:00", text: "ขอบคุณค่ะ — ขอให้ผู้ดูแลในครัวเรือนเข้าร่วม family-based intervention หลังออก รพ." }
+  ]
+};
 
 const QA_RUBRIC = [
   { id: "complete",   label: "ความครบถ้วนของข้อมูล",      hint: "กรอกครบทุก section · ไม่มีช่องว่าง" },
@@ -4080,8 +3976,8 @@ function VisitFormScreen({ patient, onSaved, onCancel }) {
 
     setSaving(true);
     try {
-      // createVisit needs the backend's internal patient_id (fall back to pid).
-      await LTC_API.submitVisit({ patient_id: patient.patient_id || patient.pid, PID: patient.pid, ...form, adl_total: totalADL, nineq_total: total9Q });
+      // live → RPC submitVisit; offline → mock (resolves after a short delay)
+      await LTC_API.submitVisit({ PID: patient.pid, ...form, adl_total: totalADL, nineq_total: total9Q });
       setSaving(false);
       Swal.fire({
         icon: "success",
@@ -4227,21 +4123,9 @@ function App() {
     else setRoute({ name: "home" });
   };
 
-  const openNewVisit = async () => {
-    // Pull the live roster so the picker reflects real patients.
-    let patients = [];
-    Swal.fire({ title: "กำลังโหลดรายชื่อ…", didOpen: () => Swal.showLoading(), allowOutsideClick: false });
-    try {
-      patients = await LTC_API.listPatients();
-    } catch (e) {
-      Swal.fire({ icon: "error", title: "โหลดรายชื่อไม่สำเร็จ", text: e.message || String(e) });
-      return;
-    }
-    if (!Array.isArray(patients) || patients.length === 0) {
-      Swal.fire({ icon: "info", title: "ยังไม่มีผู้สูงอายุในระบบ", text: "กรุณาเพิ่มข้อมูลผู้สูงอายุก่อน" });
-      return;
-    }
-    const opts = patients.map(p => `<option value="${p.patient_id || p.pid}">${p.name}${p.village ? " · " + p.village : ""}</option>`).join("");
+  const openNewVisit = () => {
+    // ask which patient
+    const opts = PATIENTS.map(p => `<option value="${p.pid}">${p.name} (${p.adl_group})</option>`).join("");
     Swal.fire({
       title: "เลือกผู้สูงอายุที่จะเยี่ยม",
       html: `<select id="pick" class="swal2-select" style="width:90%; height:44px; border:1px solid #d9e0eb; border-radius:12px; padding:0 12px; font-family:Mitr">${opts}</select>`,
@@ -4251,8 +4135,8 @@ function App() {
       preConfirm: () => document.getElementById("pick").value
     }).then(r => {
       if (r.isConfirmed) {
-        const p = patients.find(x => (x.patient_id || x.pid) === r.value);
-        if (p) setRoute({ name: "visit", patient: p });
+        const p = PATIENTS.find(x => x.pid === r.value);
+        setRoute({ name: "visit", patient: p });
       }
     });
   };
