@@ -4429,14 +4429,26 @@ Object.assign(window, { VisitFormScreen, blankForm, STEPS });
 
 const { useState: uSA } = React;
 
-function App() {
-  const [route, setRoute] = uSA({ name: "login" });
+// Pick the landing screen for a role.
+function homeRouteForRole_(role) {
+  if (role === "admin") return { name: "admin" };
+  if (role === "case_manager") return { name: "cm" };
+  return { name: "home" };
+}
 
-  const goHomeForRole = (role) => {
-    if (role === "admin") setRoute({ name: "admin" });
-    else if (role === "case_manager") setRoute({ name: "cm" });
-    else setRoute({ name: "home" });
-  };
+function App() {
+  // Restore the session on refresh: if a user + token are already persisted,
+  // land on their home screen instead of bouncing back to login.
+  const [route, setRoute] = uSA(() => {
+    try {
+      const u = LTC_API.getUser();
+      const tok = LTC_API.getToken();
+      if (u && u.role && tok) return homeRouteForRole_(u.role);
+    } catch (e) { /* fall through to login */ }
+    return { name: "login" };
+  });
+
+  const goHomeForRole = (role) => setRoute(homeRouteForRole_(role));
 
   const openNewVisit = async () => {
     // Pull the live roster so the picker reflects real patients.
@@ -4477,7 +4489,11 @@ function App() {
       showCancelButton: true,
       confirmButtonText: "ออก",
       cancelButtonText: "อยู่ต่อ"
-    }).then(r => r.isConfirmed && setRoute({ name: "login" }));
+    }).then(r => {
+      if (!r.isConfirmed) return;
+      try { LTC_API.logout(); } catch (e) {}   // clear persisted token + user
+      setRoute({ name: "login" });
+    });
   };
 
   switch (route.name) {
