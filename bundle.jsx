@@ -57,38 +57,38 @@ const LTC_API = (() => {
   const setBaseUrl = (url) => ls.set(LS_URL, (url || "").trim());
   const isLive     = () => !!getBaseUrl();
 
-  // Logged-in user, persisted across reloads.
-  const getUser = () => { try { return JSON.parse(ls.get(LS_USER) || "null"); } catch (e) { return null; } };
-  const setUser = (u) => ls.set(LS_USER, u ? JSON.stringify(u) : "");
+  // Logged-in user + session token, persisted across reloads.
+  const getUser  = () => { try { return JSON.parse(ls.get(LS_USER) || "null"); } catch (e) { return null; } };
+  const setUser  = (u) => ls.set(LS_USER, u ? JSON.stringify(u) : "");
+  const getToken = () => ls.get(LS_TOKEN);
+  const setToken = (t) => ls.set(LS_TOKEN, t || "");
 
   async function parseJson_(res) {
     try { return await res.json(); }
     catch (e) { throw new Error("ระบบหลังบ้านตอบกลับไม่ถูกต้อง (ไม่ใช่ JSON)"); }
   }
 
-  // Read endpoint — GET ?action=<name>&...params
-  async function apiGet(action, params) {
+  // Core RPC — POST { fn, args, token } as text/plain (no CORS preflight) → { ok, ... }
+  // `args` is the positional argument list; the server injects the resolved caller
+  // as the first argument for authed functions, so callers pass only the trailing args.
+  async function rpc(fn, args, opts) {
     const url = getBaseUrl();
     if (!url) throw new Error("ยังไม่ได้ตั้งค่า URL ของระบบหลังบ้าน");
-    const qs = new URLSearchParams(Object.assign({ action }, params || {})).toString();
-    const res = await fetch(url + "?" + qs, { method: "GET" });
-    const data = await parseJson_(res);
-    if (!data || data.success === false) throw new Error((data && data.message) || "อ่านข้อมูลไม่สำเร็จ");
-    return data.data;
-  }
-
-  // Write endpoint — POST { action, payload } as text/plain (no CORS preflight)
-  async function apiPost(action, payload) {
-    const url = getBaseUrl();
-    if (!url) throw new Error("ยังไม่ได้ตั้งค่า URL ของระบบหลังบ้าน");
+    const body = { fn, args: args || [] };
+    const tok = (opts && "token" in opts) ? opts.token : getToken();
+    if (tok) body.token = tok;
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ action, payload })
+      body: JSON.stringify(body)
     });
     const data = await parseJson_(res);
-    if (!data || data.success === false) throw new Error((data && data.message) || "บันทึกข้อมูลไม่สำเร็จ");
-    return data.data;
+    if (!data || data.ok === false) {
+      const msg = (data && data.message) || "การเชื่อมต่อระบบหลังบ้านล้มเหลว";
+      if (/session|เข้าสู่ระบบ|หมดอายุ/i.test(msg)) setToken("");   // force re-login
+      throw new Error(msg);
+    }
+    return data;
   }
 
   // Backend role string → app role id used by the router.
@@ -111,81 +111,170 @@ const LTC_API = (() => {
     return (age >= 0 && age < 130) ? age : null;
   }
 
-  // Map a backend patient row into the shape the UI components expect.
-  function normalizePatient(r) {
+  // ── Reference / lookup maps (village labels + caregiver staff names) ───────
+  // Cached after first login; cleared on logout or when patients change.
+  let _mapsPromise = null;
+  function clearMaps_() { _mapsPromise = null; }
+  async function getMaps_() {
+    if (_mapsPromise) return _mapsPromise;
+    _mapsPromise = (async () => {
+      const maps = { villages: {}, villageMoo: {}, relations: {}, caregivers: {} };
+      try {
+        const ref = await rpc("getReferenceData", []);
+        const data = (ref && ref.data) || {};
+        (data.villages || []).forEach(v => {
+          const id = v.VillageID != null ? v.VillageID : v.id;
+          if (id == null || id === "") return;
+          maps.villageMoo[id] = v.MooNumber;
+          maps.villages[id] = (v.MooNumber != null && v.MooNumber !== "")
+            ? ("หมู่ " + v.MooNumber + (v.VillageName ? " " + v.VillageName : ""))
+            : (v.VillageName || String(id));
+        });
+        (data.relations || []).forEach(r => {
+          const id = r.RelationID != null ? r.RelationID : r.id;
+          if (id != null) maps.relations[id] = r.RelationName || r.name || String(id);
+        });
+      } catch (e) { /* reference data is best-effort */ }
+      try {
+        const us = await rpc("listUsers", []);   // admin-only; ignored otherwise
+        (us.users || []).forEach(u => {
+          if (String(u.Role) === "caregiver") maps.caregivers[u.UserID] = u.FullName || u.UserID;
+        });
+      } catch (e) { /* non-admin: caregiver names stay as UserIDs */ }
+      return maps;
+    })();
+    return _mapsPromise;
+  }
+
+  // Map a backend patient row (database/Patients.gs schema) into the UI shape.
+  function normalizePatient(r, maps) {
     if (!r) return r;
+    maps = maps || {};
+    const vid   = r.VillageID;
+    const cgId  = r.AssignedCaregiverUserID;
+    const birth = r.BirthDate || "";
     return {
-      pid: String(r.PID != null ? r.PID : (r.patient_id || "")),
-      patient_id: r.patient_id || "",
-      name: r.name || r.FullName || "—",
-      age: ageFromBirthdate(r.birthdateBE),
-      sex: r.gender || r.Sex || "",
-      village: (r.moo != null && r.moo !== "") ? ("หมู่ " + r.moo) : (r.VillageName || ""),
-      moo: r.moo,
-      address: r.address != null ? String(r.address) : "",
-      caregiver_at_home: r.caregiverName || "",
-      relation: r.relation || "",
-      contact: r.phone || "",
-      adl_group: r.adl_group || null,     // not provided by this backend
-      risk: r.risk || null,               // not provided by this backend
-      last_visit: r.lastVisit || "—",
-      visit_count: r.visitCount || 0,
-      assigned_cg: r.caregiverName || "", // backend models the caregiver as a name
+      pid: String(r.PID != null ? r.PID : ""),
+      patient_id: String(r.PID != null ? r.PID : ""),   // backend keys patients by PID
+      name: r.FullName || "—",
+      age: (r.Age !== "" && r.Age != null) ? Number(r.Age) : ageFromBirthdate(birth),
+      sex: r.Sex || "",
+      village: (maps.villages && maps.villages[vid]) || (vid ? String(vid) : ""),
+      village_id: vid != null ? vid : "",
+      moo: (maps.villageMoo && maps.villageMoo[vid] != null) ? maps.villageMoo[vid] : undefined,
+      address: r.Address != null ? String(r.Address) : "",
+      caregiver_at_home: r.HouseholdCaregiverName || "",
+      relation: r.HouseholdRelationID || "",
+      contact: r.HouseholdContact || "",
+      adl_group: r.ADLGroup || null,
+      risk: r.RiskLevel || null,
+      last_visit: r.LastVisitDate || "—",
+      visit_count: Number(r.VisitCount) || 0,
+      assigned_cg: (maps.caregivers && maps.caregivers[cgId]) || (cgId ? String(cgId) : ""),
+      assigned_cg_id: cgId != null ? cgId : "",
       distance_km: null,
       due_today: false, visited_today: false,
-      profileImageUrl: r.profileImageUrl || "",
-      birthdateBE: r.birthdateBE || null,
+      profileImageUrl: r.ProfileImageUrl || r.profileImageUrl || "",
+      birthdateBE: birth || null,
+      lat: (r.Lat !== "" && r.Lat != null && !isNaN(+r.Lat)) ? +r.Lat : null,
+      lng: (r.Lng !== "" && r.Lng != null && !isNaN(+r.Lng)) ? +r.Lng : null,
+      _raw: r
+    };
+  }
+
+  // Map a backend visit row → the flat shape VisitRow/dashboard expect.
+  // ctx = { patients: {pid->{name,village}}, caregivers: {userId->name} }
+  function normalizeVisit(r, ctx) {
+    if (!r) return r; ctx = ctx || {};
+    const pid = String(r.PID != null ? r.PID : "");
+    const p = (ctx.patients && ctx.patients[pid]) || {};
+    const date = String(r.VisitDate || "").slice(0, 10);
+    const num = (x) => (x === "" || x == null || isNaN(+x)) ? 0 : +x;
+    return {
+      id: r.VisitID || "",
+      pid,
+      date: date.length === 10 ? date.slice(5).replace("-", "/") + "/" + date.slice(0, 4).slice(2) : (date || "—"),
+      raw_date: date,
+      name: p.name || pid || "—",
+      village: p.village || "",
+      cg: (ctx.caregivers && ctx.caregivers[r.CaregiverUserID]) || r.CaregiverUserID || "",
+      adl: num(r.ADLTotal),
+      q9: num(r.NineQTotal),
+      q8: num(r.EightQTotal),
+      risk: r.RiskLevel || "ปกติ",
       _raw: r
     };
   }
 
   // ── High-level operations ─────────────────────────────────────────────────
+  // login is the only PUBLIC fn → call with token:"" so no stale token is sent.
   async function login(username, password) {
-    const user = await apiPost("login", { username, password }); // { id, username, name, role }
-    const role = mapRole(user && user.role);
-    const merged = Object.assign({}, user, { role });
+    const r = await rpc("login", [username, password], { token: "" });
+    setToken(r.token || "");
+    clearMaps_();
+    const u = r.user || {};
+    const role = mapRole(u.Role);
+    const merged = {
+      id: u.UserID, user_id: u.UserID, username: u.Username,
+      name: u.FullName, role,
+      initials: u.Initials || "", village_id: u.VillageID || "", phone: u.Phone || ""
+    };
     setUser(merged);
     return { ok: true, user: merged, role };
   }
 
-  async function listPatients() {
-    const rows = await apiGet("listPatients");
-    return (Array.isArray(rows) ? rows : []).map(normalizePatient);
+  // Patients — server scopes by role (caregivers see only their own).
+  async function listPatients(opts) {
+    const out = await rpc("listPatients", [opts || {}]);
+    const maps = await getMaps_();
+    return (Array.isArray(out.patients) ? out.patients : []).map(r => normalizePatient(r, maps));
   }
 
-  // payload must carry patient_id (the backend's internal id)
-  async function submitVisit(payload) { return await apiPost("createVisit", payload); }
+  // Reference + user directory
+  async function getReferenceData() { const r = await rpc("getReferenceData", []); return (r && r.data) || {}; }
+  async function listCaregivers() { const m = await getMaps_(); return Object.keys(m.caregivers).map(id => ({ id, name: m.caregivers[id] })); }
+  async function listUsers() { const r = await rpc("listUsers", []); return r.users || []; }
+  async function createUser(payload) { return await rpc("createUser", [payload]); }
+  async function updateUser(userId, patch) { return await rpc("updateUser", [userId, patch]); }
+  async function resetPassword(userId, newPassword) { return await rpc("resetPassword", [userId, newPassword]); }
 
-  // payload must carry PID (13-digit national id)
-  async function createPatient(payload) { return await apiPost("createPatient", payload); }
-  async function updatePatient(payload) { return await apiPost("updatePatient", payload); }
-  async function deletePatient(patient_id) { return await apiPost("deletePatient", { patient_id }); }
+  // Patient registry (admin). updatePatient(pid, patch); delete = soft (Active:false).
+  async function createPatient(payload) { const r = await rpc("createPatient", [payload]); clearMaps_(); return r; }
+  async function updatePatient(pid, patch) { return await rpc("updatePatient", [pid, patch]); }
+  async function deletePatient(pid) { return await rpc("updatePatient", [pid, { Active: false }]); }
+  async function assignCaregiver(pid, caregiverUserId) { const r = await rpc("assignCaregiver", [pid, caregiverUserId]); return r; }
 
-  // The backend stores the caregiver as a free-text name on the patient row.
-  async function assignCaregiver(patient_id, caregiverName) {
-    return await apiPost("updatePatient", { patient_id, caregiverName });
-  }
+  // Visits + cases
+  async function submitVisit(payload) { return await rpc("submitVisit", [payload]); }
+  async function listVisits(opts) { const r = await rpc("listVisits", [opts || {}]); return r.visits || []; }
+  async function getVisit(visitId) { return await rpc("getVisit", [visitId]); }
+  async function getVisitsLast14Days() { const r = await rpc("getVisitsLast14Days", []); return r.buckets || []; }
+  async function listCases(opts) { const r = await rpc("listCases", [opts || {}]); return r.cases || []; }
 
-  async function getSettings() { return await apiGet("getSettings"); }
-  async function saveSettings(arr) { return await apiPost("saveSettings", arr); }
+  // The backend has no settings endpoint — expose reference data for read,
+  // and treat save as unsupported (kept for API-shape compatibility).
+  async function getSettings() { try { return await getReferenceData(); } catch (e) { return {}; } }
+  async function saveSettings() { throw new Error("ระบบหลังบ้านนี้ยังไม่รองรับการบันทึกการตั้งค่า"); }
 
-  // Connectivity check — GET ?action=ping → { success:true, message:"pong" }
+  // Connectivity check — GET → health JSON { ok, service, version, time }
   async function ping() {
     const url = getBaseUrl();
     if (!url) throw new Error("ยังไม่ได้ตั้งค่า URL");
-    const res = await fetch(url + "?action=ping", { method: "GET" });
+    const res = await fetch(url, { method: "GET" });
     const data = await parseJson_(res);
-    if (!data || data.success === false) throw new Error((data && data.message) || "ตอบกลับไม่ถูกต้อง");
-    return { ok: true, service: "LTC Dependence", version: "live", message: data.message };
+    if (!data || data.ok === false) throw new Error((data && data.message) || "ตอบกลับไม่ถูกต้อง");
+    return { ok: true, service: data.service || "LTC Dependence", version: data.version || "live", message: "pong" };
   }
 
-  function logout() { setUser(null); }
+  function logout() { setToken(""); setUser(null); clearMaps_(); }
 
   return {
-    apiGet, apiPost, login, listPatients, submitVisit,
+    rpc, login, listPatients, getReferenceData, listCaregivers, listUsers,
+    createUser, updateUser, resetPassword,
     createPatient, updatePatient, deletePatient, assignCaregiver,
+    submitVisit, listVisits, getVisit, getVisitsLast14Days, listCases,
     getSettings, saveSettings, ping, logout,
-    getBaseUrl, setBaseUrl, getUser, setUser, isLive, normalizePatient,
+    getBaseUrl, setBaseUrl, getUser, setUser, getToken, setToken, isLive, normalizePatient, normalizeVisit,
     DEFAULT_URL
   };
 })();
@@ -1076,18 +1165,20 @@ function HomeScreen({ onOpenNewVisit, onOpenPatient, onLogout }) {
   const [q, setQ] = uS1("");
   const [view, setView] = uS1("home"); // home · report · map · me
   const [roster, setRoster] = uS1(PATIENTS);
+  const [myVisitCount, setMyVisitCount] = uS1(0);
 
   const today = thaiDateString();
 
-  // Load from the real backend when an API URL is configured; otherwise the
-  // mock PATIENTS seed keeps the prototype fully functional offline.
+  // Load the caregiver's own roster + visit feed from the backend. The server
+  // already scopes both reads to the logged-in caregiver.
   uE1(() => {
     let alive = true;
-    if (LTC_API.isLive()) {
-      LTC_API.listPatients({}).then(list => {
-        if (alive && Array.isArray(list)) setRoster(list);
-      }).catch(() => {});
-    }
+    LTC_API.listPatients({}).then(list => {
+      if (alive && Array.isArray(list)) setRoster(list);
+    }).catch(() => {});
+    LTC_API.listVisits({}).then(v => {
+      if (alive && Array.isArray(v)) setMyVisitCount(v.length);
+    }).catch(() => {});
     return () => { alive = false; };
   }, []);
 
@@ -1217,11 +1308,11 @@ function HomeScreen({ onOpenNewVisit, onOpenPatient, onLogout }) {
           </div>
         </>
       ) : view === "report" ? (
-        <CGReportPanel patients={myPatients} riskCount={riskCount} todayPlanned={todayPlanned} visitedToday={visitedToday}/>
+        <CGReportPanel patients={myPatients} riskCount={riskCount} todayPlanned={todayPlanned} visitedToday={visitedToday} visitCount={myVisitCount}/>
       ) : view === "map" ? (
         <CGMapPanel patients={myPatients} onOpenPatient={onOpenPatient}/>
       ) : (
-        <CGProfilePanel patients={myPatients} onLogout={onLogout}/>
+        <CGProfilePanel patients={myPatients} onLogout={onLogout} visitCount={myVisitCount}/>
       )}
 
       {/* Bottom nav */}
@@ -1262,9 +1353,9 @@ function HomeScreen({ onOpenNewVisit, onOpenPatient, onLogout }) {
 }
 
 // ───────────────────────────────────────────── Care Giver · Report panel
-function CGReportPanel({ patients, riskCount, todayPlanned, visitedToday }) {
+function CGReportPanel({ patients, riskCount, todayPlanned, visitedToday, visitCount = 0 }) {
   const byAdl = (g) => patients.filter(p => p.adl_group === g).length;
-  const myVisits = VISITS.filter(v => v.cg === CURRENT_USER.name);
+  const myVisits = { length: visitCount };
   const adlGroups = [
     { g: "ติดสังคม", tone: "ok" },
     { g: "ติดบ้าน",  tone: "warning" },
@@ -1405,8 +1496,8 @@ function CGMapPanel({ patients, onOpenPatient }) {
 }
 
 // ───────────────────────────────────────────── Care Giver · Profile panel
-function CGProfilePanel({ patients, onLogout }) {
-  const myVisits = VISITS.filter(v => v.cg === CURRENT_USER.name).length;
+function CGProfilePanel({ patients, onLogout, visitCount = 0 }) {
+  const myVisits = visitCount;
   const changePw = () => Swal.fire({
     icon: "info",
     title: "เปลี่ยนรหัสผ่าน",
@@ -1510,44 +1601,72 @@ function AdminDashboard({ onLogout, onNav }) {
   const [riskFilter, setRiskFilter] = usD("all");
   const [village, setVillage] = usD("all");
   const [patients, setPatients] = usD([]);
+  const [visits, setVisits] = usD([]);
+  const [buckets14d, setBuckets14d] = usD([]);
 
-  // Live patient roster from the backend (listPatients).
+  // Live roster + visit feed from the backend.
   useEffect(() => {
     let alive = true;
-    LTC_API.listPatients()
-      .then(list => { if (alive && Array.isArray(list)) setPatients(list); })
-      .catch(() => {});
+    (async () => {
+      try {
+        const [pts, cgs, rawVisits, buckets] = await Promise.all([
+          LTC_API.listPatients().catch(() => []),
+          LTC_API.listCaregivers().catch(() => []),
+          LTC_API.listVisits({ limit: 100 }).catch(() => []),
+          LTC_API.getVisitsLast14Days().catch(() => [])
+        ]);
+        if (!alive) return;
+        const plist = Array.isArray(pts) ? pts : [];
+        setPatients(plist);
+        setBuckets14d(Array.isArray(buckets) ? buckets : []);
+        // Build join context for visit rows.
+        const pmap = {}; plist.forEach(p => { pmap[String(p.pid)] = { name: p.name, village: p.village }; });
+        const cmap = {}; (Array.isArray(cgs) ? cgs : []).forEach(c => { cmap[c.id] = c.name; });
+        const norm = (Array.isArray(rawVisits) ? rawVisits : []).map(v => LTC_API.normalizeVisit(v, { patients: pmap, caregivers: cmap }));
+        setVisits(norm);
+      } catch (e) { /* graceful empty */ }
+    })();
     return () => { alive = false; };
   }, []);
 
   // ─── KPIs ────────────────────────────────────────────────────────────────
-  // cases = live roster size; visit-derived figures depend on a visits-read
-  // endpoint the backend does not expose yet, so they stay at 0 (honest).
   const k = umD(() => {
     const cases = patients.length;
-    const visits = VISITS.length;
-    const lowADL = VISITS.filter(v => v.adl <= 11).length;
-    const high9Q = VISITS.filter(v => v.q9 >= 7).length;
-    const has8Q = VISITS.filter(v => v.q8 > 0).length;
-    const latestDate = VISITS.length ? VISITS[0].date : null;
-    const visitsToday = latestDate ? VISITS.filter(v => v.date === latestDate).length : 0;
-    return { cases, visits, lowADL, high9Q, has8Q, visitsToday };
-  }, [patients]);
+    const v = visits;
+    const total = v.length;
+    const lowADL = v.filter(x => x.adl > 0 && x.adl <= 11).length;
+    const high9Q = v.filter(x => x.q9 >= 7).length;
+    const has8Q = v.filter(x => x.q8 > 0).length;
+    const latestDate = v.length ? v[0].raw_date : null;
+    const visitsToday = latestDate ? v.filter(x => x.raw_date === latestDate).length : 0;
+    return { cases, visits: total, lowADL, high9Q, has8Q, visitsToday };
+  }, [patients, visits]);
 
-  // Care Givers derived from the live roster (backend has no caregivers feed).
+  // Care Givers derived from the live roster (count of assigned cases).
   const caregivers = umD(() => {
     const m = {};
     patients.forEach(p => {
       const n = p.assigned_cg;
       if (!n) return;
-      if (!m[n]) m[n] = { id: n, name: n, village: p.village || "", cases: 0, active: true };
-      m[n].cases++;
+      const key = p.assigned_cg_id || n;
+      if (!m[key]) m[key] = { id: key, name: n, village: p.village || "", cases: 0, active: true };
+      m[key].cases++;
     });
     return Object.values(m).sort((a, b) => b.cases - a.cases);
   }, [patients]);
 
+  // 14-day chart counts.
+  const chart14d = umD(() => buckets14d.map(b => Number(b.count) || 0), [buckets14d]);
+
+  // Distinct villages present across the roster (for the filter chips).
+  const villageOptions = umD(() => {
+    const s = new Set();
+    patients.forEach(p => { if (p.village) s.add(p.village); });
+    return Array.from(s).sort();
+  }, [patients]);
+
   // ─── Filtered visits ─────────────────────────────────────────────────────
-  const filtered = umD(() => VISITS.filter(v => {
+  const filtered = umD(() => visits.filter(v => {
     if (riskFilter !== "all" && v.risk !== riskFilter) return false;
     if (village !== "all" && v.village !== village) return false;
     if (query) {
@@ -1555,7 +1674,7 @@ function AdminDashboard({ onLogout, onNav }) {
       if (!(v.name + v.pid + v.cg).toLowerCase().includes(q)) return false;
     }
     return true;
-  }), [query, riskFilter, village]);
+  }), [visits, query, riskFilter, village]);
 
   const exportFile = (kind) => {
     Swal.fire({
@@ -1657,15 +1776,12 @@ function AdminDashboard({ onLogout, onNav }) {
 
       {/* Visits trend chart */}
       <SectionCard title="แนวโน้มการเยี่ยม · 14 วันที่ผ่านมา" subtitle="จำนวนครั้งต่อวัน">
-        <VisitsBarChart data={VISITS_14D}/>
+        <VisitsBarChart data={chart14d}/>
         <div className="flex items-center justify-between text-[12px] text-ink-500">
           <span className="inline-flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-sm bg-ink-800"></span> ทั้งหมด
           </span>
-          <span className="inline-flex items-center gap-1.5">
-            <span className="w-2 h-2 rounded-sm bg-accent-coral"></span> เคสเสี่ยง
-          </span>
-          <span className="tnum">เฉลี่ย {VISITS_14D.length ? (VISITS_14D.reduce((s,v)=>s+v,0)/VISITS_14D.length).toFixed(1) : "0"} ครั้ง/วัน</span>
+          <span className="tnum">เฉลี่ย {chart14d.length ? (chart14d.reduce((s,v)=>s+v,0)/chart14d.length).toFixed(1) : "0"} ครั้ง/วัน</span>
         </div>
       </SectionCard>
 
@@ -1756,7 +1872,7 @@ function AdminDashboard({ onLogout, onNav }) {
             );
           })}
           <span className="w-px shrink-0 bg-ink-200 mx-1 self-stretch"></span>
-          {["all","หมู่ 4","หมู่ 5","หมู่ 7"].map(v => {
+          {["all", ...villageOptions].map(v => {
             const on = village === v;
             return (
               <button
@@ -2010,10 +2126,24 @@ const ROLE_BADGE = {
   "Case Manager": { tone: "warning", label: "Case Manager" }
 };
 
-// The backend exposes no users endpoint, so user management starts empty
-// (local-only editor). No mock accounts are seeded.
-function seedUsers() {
-  return [];
+// Map between backend role codes and the UI labels used by UsersScreen.
+const ROLE_TO_UI = { caregiver: "Care Giver", case_manager: "Case Manager", admin: "Admin" };
+const ROLE_TO_BE = { "Care Giver": "caregiver", "Case Manager": "case_manager", "Admin": "admin" };
+
+// Backend user row (sanitized) → UI-shaped record.
+function normalizeUser(u) {
+  return {
+    user_id: u.UserID || "",
+    name: u.FullName || "",
+    username: u.Username || "",
+    role: ROLE_TO_UI[u.Role] || u.Role || "Care Giver",
+    village: u.VillageID != null ? String(u.VillageID) : "",
+    phone: u.Phone || "",
+    email: u.Email || "",
+    active: u.Active !== false,
+    cases: 0,
+    _raw: u
+  };
 }
 
 // ────────────────────────────────────────────────────────────── Bottom Sheet
@@ -2055,10 +2185,15 @@ function BottomSheet({ open, onClose, title, children, actions }) {
 
 // ─────────────────────────────────────────────────────────── User Management
 function UsersScreen({ onBack }) {
-  const [users, setUsers] = usM(() => seedUsers());
+  const [users, setUsers] = usM([]);
   const [role, setRole] = usM("all");
   const [q, setQ] = usM("");
   const [editing, setEditing] = usM(null);    // user object or "new"
+
+  const reload = () => LTC_API.listUsers()
+    .then(rows => { if (Array.isArray(rows)) setUsers(rows.map(normalizeUser)); })
+    .catch(() => {});
+  ueM(() => { reload(); }, []);
 
   const filtered = umM(() => users.filter(u => {
     if (role !== "all" && u.role !== role) return false;
@@ -2077,11 +2212,10 @@ function UsersScreen({ onBack }) {
   }), [users]);
 
   const openNew = () => setEditing({
-    user_id: `CG-${String(Math.floor(20 + Math.random()*900)).padStart(3,"0")}`,
-    name: "", role: "Care Giver", username: "", village: "หมู่ 4", phone: "", cases: 0, active: true
+    user_id: "", name: "", role: "Care Giver", username: "", village: "", phone: "", cases: 0, active: true
   });
 
-  const save = (next) => {
+  const save = async (next) => {
     if (!next.name || !next.username || !next.phone) {
       Swal.fire({ icon: "warning", title: "ข้อมูลไม่ครบ", text: "กรุณาระบุชื่อ · username · เบอร์ติดต่อ" });
       return;
@@ -2090,21 +2224,43 @@ function UsersScreen({ onBack }) {
       Swal.fire({ icon: "warning", title: "เบอร์ไม่ถูกต้อง", text: "ต้องเป็นตัวเลข 9-10 หลัก" });
       return;
     }
-    const exists = users.some(u => u.user_id === next.user_id);
-    setUsers(exists ? users.map(u => u.user_id === next.user_id ? next : u) : [next, ...users]);
-    setEditing(null);
-    Swal.fire({ icon: "success", title: exists ? "อัปเดตสำเร็จ" : "เพิ่มผู้ใช้สำเร็จ", timer: 1100, showConfirmButton: false });
+    const exists = !!next.user_id;
+    try {
+      if (exists) {
+        await LTC_API.updateUser(next.user_id, {
+          FullName: next.name, Role: ROLE_TO_BE[next.role] || "caregiver",
+          VillageID: next.village || "", Phone: next.phone, Email: next.email || "",
+          Active: next.active !== false
+        });
+      } else {
+        await LTC_API.createUser({
+          Username: next.username, FullName: next.name, Role: ROLE_TO_BE[next.role] || "caregiver",
+          VillageID: next.village || "", Phone: next.phone, Email: next.email || "",
+          Active: next.active !== false
+        });
+      }
+      await reload();
+      setEditing(null);
+      Swal.fire({ icon: "success", title: exists ? "อัปเดตสำเร็จ" : "เพิ่มผู้ใช้สำเร็จ", timer: 1100, showConfirmButton: false });
+    } catch (e) {
+      Swal.fire({ icon: "error", title: "บันทึกไม่สำเร็จ", text: e.message || String(e) });
+    }
   };
 
+  // No hard-delete endpoint — disable the account (Active:false) instead.
   const remove = (u) => {
     Swal.fire({
-      icon: "warning", title: "ลบผู้ใช้?", html: `<b>${u.name}</b><br/><span style="color:#506aa3">${u.user_id}</span>`,
-      showCancelButton: true, confirmButtonText: "ลบ", cancelButtonText: "ยกเลิก"
-    }).then(r => {
-      if (r.isConfirmed) {
-        setUsers(users.filter(x => x.user_id !== u.user_id));
+      icon: "warning", title: "ปิดการใช้งานบัญชี?", html: `<b>${u.name}</b><br/><span style="color:#506aa3">${u.user_id}</span><br/><span style="color:#888;font-size:12px">บัญชีจะไม่ถูกลบ แต่จะเข้าสู่ระบบไม่ได้</span>`,
+      showCancelButton: true, confirmButtonText: "ปิดการใช้งาน", cancelButtonText: "ยกเลิก"
+    }).then(async r => {
+      if (!r.isConfirmed) return;
+      try {
+        await LTC_API.updateUser(u.user_id, { Active: false });
+        await reload();
         setEditing(null);
-        Swal.fire({ icon: "success", title: "ลบแล้ว", timer: 900, showConfirmButton: false });
+        Swal.fire({ icon: "success", title: "ปิดการใช้งานแล้ว", timer: 1000, showConfirmButton: false });
+      } catch (e) {
+        Swal.fire({ icon: "error", title: "ดำเนินการไม่สำเร็จ", text: e.message || String(e) });
       }
     });
   };
@@ -2219,7 +2375,7 @@ function UserEditor({ user, onSave, onDelete, onClose }) {
         <>
           {user.name ? (
             <GhostButton onClick={() => onDelete(user)} className="text-accent-coral border-accent-coral/30">
-              ลบ
+              ปิดใช้งาน
             </GhostButton>
           ) : null}
           <GhostButton onClick={onClose} className="flex-1">ยกเลิก</GhostButton>
@@ -2244,7 +2400,7 @@ function UserEditor({ user, onSave, onDelete, onClose }) {
       </Field>
       <div className="grid grid-cols-2 gap-3">
         <Field label="username" required>
-          <TextInput value={d.username} onChange={e => set({ username: e.target.value.replace(/\s/g,"") })} placeholder="username"/>
+          <TextInput value={d.username} onChange={e => set({ username: e.target.value.replace(/\s/g,"") })} placeholder="username" readOnly={!!d.user_id}/>
         </Field>
         <Field label="เบอร์ติดต่อ" required>
           <TextInput
@@ -2283,17 +2439,19 @@ function PatientsScreen({ onBack }) {
     .catch(() => {});
   ueM(() => { reload(); }, []);
 
-  // Map the editor's (app-shaped) record to the backend patient payload.
+  // Map the editor's (app-shaped) record to the backend patient row schema.
   const toBackend = (p) => ({
-    patient_id: p.patient_id || undefined,
     PID: p.pid,
-    name: p.name,
-    gender: p.sex,
-    moo: (String(p.village).match(/\d+/) || [""])[0],
-    address: p.address,
-    phone: p.contact,
-    caregiverName: p.caregiver_at_home,
-    birthdateBE: p.birthdateBE || undefined
+    FullName: p.name,
+    BirthDate: p.birthdateBE || "",
+    Age: (p.age === "" || p.age == null) ? "" : Number(p.age),
+    Sex: p.sex,
+    VillageID: p.village_id || p.village || "",
+    Address: p.address || "",
+    HouseholdCaregiverName: p.caregiver_at_home || "",
+    HouseholdRelationID: p.relation || "",
+    HouseholdContact: p.contact || "",
+    AssignedCaregiverUserID: p.assigned_cg_id || ""
   });
 
   const filtered = umM(() => list.filter(p => {
@@ -2331,10 +2489,11 @@ function PatientsScreen({ onBack }) {
       Swal.fire({ icon: "warning", title: "เบอร์ไม่ถูกต้อง", text: "ต้องเป็นตัวเลข 9-10 หลัก" });
       return;
     }
-    const exists = !!next.patient_id;
+    const exists = list.some(p => String(p.pid) === String(next.pid));
     try {
-      if (exists) await LTC_API.updatePatient(toBackend(next));
-      else        await LTC_API.createPatient(toBackend(next));
+      const payload = toBackend(next);
+      if (exists) { delete payload.PID; await LTC_API.updatePatient(next.pid, payload); }
+      else        await LTC_API.createPatient(payload);
       await reload();
       setEditing(null);
       Swal.fire({ icon: "success", title: exists ? "อัปเดตสำเร็จ" : "เพิ่มผู้สูงอายุสำเร็จ", timer: 1100, showConfirmButton: false });
@@ -2350,7 +2509,7 @@ function PatientsScreen({ onBack }) {
     }).then(async r => {
       if (!r.isConfirmed) return;
       try {
-        await LTC_API.deletePatient(p.patient_id);
+        await LTC_API.deletePatient(p.pid);
         await reload();
         setEditing(null);
         Swal.fire({ icon: "success", title: "ลบแล้ว", timer: 900, showConfirmButton: false });
@@ -2547,26 +2706,21 @@ function PatientEditor({ patient, onSave, onDelete, onClose }) {
 // ─────────────────────────────────────────────── Assign Care Giver (Admin)
 function AssignScreen({ onBack }) {
   const [list, setList] = usM([]);
+  const [caregivers, setCaregivers] = usM([]); // [{id, name}]
   const [q, setQ] = usM("");
   const [picking, setPicking] = usM(null); // patient currently being (re)assigned
 
-  // Load the full roster from the backend (admin sees all).
+  // Load the full roster + the real list of staff Care Givers from the backend.
   ueM(() => {
     let alive = true;
     LTC_API.listPatients().then(rows => {
       if (alive && Array.isArray(rows)) setList(rows);
     }).catch(() => {});
+    LTC_API.listCaregivers().then(rows => {
+      if (alive && Array.isArray(rows)) setCaregivers(rows);
+    }).catch(() => {});
     return () => { alive = false; };
   }, []);
-
-  // The backend models the Care Giver as a free-text name stored on each patient
-  // row (there is no caregivers table/endpoint), so the available options are the
-  // distinct names already present across the roster.
-  const cgNames = umM(() => {
-    const s = new Set();
-    list.forEach(p => { if (p.assigned_cg) s.add(p.assigned_cg); });
-    return Array.from(s).sort();
-  }, [list]);
 
   const filtered = umM(() => list.filter(p => {
     if (!q) return true;
@@ -2574,37 +2728,26 @@ function AssignScreen({ onBack }) {
     return (p.name + p.pid + p.village + (p.assigned_cg || "")).toLowerCase().includes(n);
   }), [list, q]);
 
-  const assignedCount = umM(() => list.filter(p => p.assigned_cg).length, [list]);
+  const assignedCount = umM(() => list.filter(p => p.assigned_cg_id).length, [list]);
   const unassignedCount = list.length - assignedCount;
 
-  const apply = async (patient_id, caregiverName) => {
+  const apply = async (patient_id, caregiver) => {
     try {
-      // assignCaregiver(patient_id, caregiverName) → POST updatePatient (admin-only).
-      if (caregiverName) await LTC_API.assignCaregiver(patient_id, caregiverName);
+      // assignCaregiver(pid, caregiverUserId) — backend validates the user is role caregiver.
+      if (!caregiver || !caregiver.id) return;
+      await LTC_API.assignCaregiver(patient_id, caregiver.id);
       setList(list.map(p => (p.patient_id === patient_id || p.pid === patient_id)
-        ? { ...p, assigned_cg: caregiverName, caregiver_at_home: caregiverName } : p));
+        ? { ...p, assigned_cg: caregiver.name, assigned_cg_id: caregiver.id } : p));
       setPicking(null);
       Swal.fire({
         icon: "success",
         title: "มอบหมายสำเร็จ",
-        html: `มอบหมายให้ <b>${caregiverName}</b>`,
+        html: `มอบหมายให้ <b>${caregiver.name}</b>`,
         timer: 1200, showConfirmButton: false
       });
     } catch (e) {
       Swal.fire({ icon: "error", title: "มอบหมายไม่สำเร็จ", text: e.message || String(e) });
     }
-  };
-
-  const promptNewName = (patient_id) => {
-    Swal.fire({
-      title: "ระบุชื่อ Care Giver",
-      input: "text",
-      inputPlaceholder: "เช่น นางสมจิตร ใจดี",
-      showCancelButton: true,
-      confirmButtonText: "มอบหมาย",
-      cancelButtonText: "ยกเลิก",
-      inputValidator: (v) => (!v || !v.trim()) ? "กรุณาระบุชื่อ" : undefined
-    }).then(r => { if (r.isConfirmed && r.value) apply(patient_id, r.value.trim()); });
   };
 
   return (
@@ -2680,28 +2823,27 @@ function AssignScreen({ onBack }) {
       >
         {picking ? (
           <div className="space-y-2">
-            {cgNames.map(name => {
-              const on = picking.assigned_cg === name;
+            {caregivers.map(cg => {
+              const on = String(picking.assigned_cg_id) === String(cg.id);
               return (
                 <button
-                  key={name}
-                  onClick={() => apply(picking.patient_id || picking.pid, name)}
+                  key={cg.id}
+                  onClick={() => apply(picking.patient_id || picking.pid, cg)}
                   className={"w-full text-left rounded-2xl border p-3.5 flex items-center gap-3 transition " + (on ? "radio-card-on" : "border-ink-200 bg-white")}
                 >
                   <div className="w-10 h-10 rounded-xl bg-paper grid place-items-center font-medium text-ink-700">
-                    {name.replace(/^น(าง|าย|.ส.)\s*/,"").slice(0,2)}
+                    {cg.name.replace(/^น(าง|าย|.ส.)\s*/,"").slice(0,2)}
                   </div>
                   <div className="flex-1 min-w-0">
-                    <div className="text-[14px] font-medium text-ink-900 truncate">{name}</div>
+                    <div className="text-[14px] font-medium text-ink-900 truncate">{cg.name}</div>
                   </div>
                   {on ? <span className="text-[11px] text-ink-700 shrink-0">ปัจจุบัน</span> : null}
                 </button>
               );
             })}
-            <button
-              onClick={() => promptNewName(picking.patient_id || picking.pid)}
-              className="w-full text-center rounded-2xl border border-ink-200 text-ink-700 p-3 text-[13px]"
-            >+ พิมพ์ชื่อ Care Giver ใหม่</button>
+            {caregivers.length === 0 ? (
+              <div className="rounded-2xl border border-dashed border-ink-200 p-6 text-center text-ink-500 text-[12.5px]">ยังไม่มีบัญชี Care Giver ในระบบ</div>
+            ) : null}
           </div>
         ) : null}
       </BottomSheet>
@@ -2921,36 +3063,47 @@ const CM_USER = {
   initials: ""
 };
 
-// ─── Seed: build cases from VISITS, grouped by PID ──────────────────────────
-function buildCases() {
-  // group by patient
-  const byPid = {};
-  VISITS.forEach(v => {
-    if (!byPid[v.pid]) byPid[v.pid] = { pid: v.pid, name: v.name, village: v.village, visits: [] };
-    byPid[v.pid].visits.push(v);
-  });
+// Map a backend case status → the UI status taxonomy (urgent/watch/qa/resolved).
+function mapCaseStatus_(beStatus, risk) {
+  if (beStatus === "resolved") return "resolved";
+  if (beStatus === "escalated") return "urgent";
+  if (beStatus === "monitoring") return "qa";
+  // open
+  return (risk === "เสี่ยงสูง") ? "urgent" : "watch";
+}
 
-  const cases = Object.values(byPid).map(c => {
-    c.visits.sort((a,b) => a.date.localeCompare(b.date));
-    const last = c.visits[c.visits.length - 1];
-    let status =
-      last.q8 > 0                                  ? "urgent"   :
-      last.q9 >= 7 || last.adl <= 4                ? "watch"    :
-      last.adl <= 11                               ? "qa"       :
-                                                     "resolved";
+// Build the UI case list from real backend rows (listCases) joined with the
+// patient roster + visit feed (for ADL/9Q/8Q chips on the triggering visit).
+async function loadCases_() {
+  const [cases, patients, visits] = await Promise.all([
+    LTC_API.listCases({}).catch(() => []),
+    LTC_API.listPatients().catch(() => []),
+    LTC_API.listVisits({ limit: 500 }).catch(() => [])
+  ]);
+  const pmap = {}; (patients || []).forEach(p => { pmap[String(p.pid)] = p; });
+  const vmap = {}; (visits || []).forEach(v => { const raw = v._raw || v; if (raw.VisitID) vmap[raw.VisitID] = raw; });
+  const num = (x) => (x === "" || x == null || isNaN(+x)) ? 0 : +x;
+  return (cases || []).map(c => {
+    const pid = String(c.PID != null ? c.PID : "");
+    const p = pmap[pid] || {};
+    const tv = vmap[c.TriggeringVisitID] || {};
+    const status = mapCaseStatus_(c.Status, c.RiskLevel || p.risk);
     return {
-      ...c,
-      adl: last.adl, q9: last.q9, q8: last.q8,
-      risk: last.risk,
-      cg: last.cg,
-      last_visit: last.date,
+      pid,
+      caseId: c.CaseID || "",
+      name: p.name || pid || "—",
+      village: p.village || "",
+      cg: p.assigned_cg || "—",
+      adl: num(tv.ADLTotal),
+      q9: num(tv.NineQTotal),
+      q8: num(tv.EightQTotal),
+      risk: c.RiskLevel || p.risk || "ปกติ",
+      last_visit: String(c.OpenedAt || tv.VisitDate || "").slice(0, 10) || "—",
       status,
-      qa_score: 4.2 - Math.random()*0.8,
-      qa_pending: status === "qa" || status === "watch"
+      qa_pending: status === "qa",
+      _raw: c
     };
   });
-
-  return cases;
 }
 
 // Comment threads keyed by PID — no backend feed yet, so none are seeded.
@@ -2973,9 +3126,15 @@ const STATUS_META = {
 
 // ─────────────────────────────────────────────────────────── CASE LIST
 function CaseManagerScreen({ onLogout, onOpenCase }) {
-  const [cases] = usC(() => buildCases());
+  const [cases, setCases] = usC([]);
   const [tab, setTab] = usC("urgent");
   const [q, setQ] = usC("");
+
+  ueC(() => {
+    let alive = true;
+    loadCases_().then(rows => { if (alive && Array.isArray(rows)) setCases(rows); }).catch(() => {});
+    return () => { alive = false; };
+  }, []);
 
   const filtered = umC(() => cases.filter(c => {
     if (tab !== "all" && c.status !== tab) return false;
@@ -4085,8 +4244,41 @@ function VisitFormScreen({ patient, onSaved, onCancel }) {
 
     setSaving(true);
     try {
-      // createVisit needs the backend's internal patient_id (fall back to pid).
-      await LTC_API.submitVisit({ patient_id: patient.patient_id || patient.pid, PID: patient.pid, ...form, adl_total: totalADL, nineq_total: total9Q });
+      // Map the form state → backend submitVisit payload schema.
+      const bp = String(form.bp || "").split("/");
+      const num = (x) => (x === "" || x == null) ? "" : (isNaN(+x) ? "" : +x);
+      const payload = {
+        PID: patient.pid,
+        // VisitDate intentionally omitted → backend defaults to today (Asia/Bangkok),
+        // avoiding a Thai-string → ISO conversion.
+        TimeStart: form.time_start || "",
+        TimeEnd: form.time_end || "",
+        HouseholdCaregiverName: form.cg_at_home || "",
+        HouseholdRelationID: form.relation || "",
+        HouseholdContact: form.contact || "",
+        WeightKg: num(form.weight),
+        HeightCm: num(form.height),
+        TempC: num(form.temp),
+        Pulse: num(form.pulse),
+        Resp: num(form.resp),
+        BPSystolic: num((bp[0] || "").trim()),
+        BPDiastolic: num((bp[1] || "").trim()),
+        ADLEnabled: !!form.adl_enabled,
+        ADLScores: form.adl || {},
+        MHEnabled: !!form.mh_enabled,
+        TwoQ: (form.twoQ || []).map(v => v === true),
+        NineQ: (form.nineQ || []).map(v => Number(v) || 0),
+        EightQ: (form.eightQ || []).map(v => v === true),
+        EightQ3Control: form.eight_q3_control || "",
+        Care: { daily: form.daily, health: form.health, other: form.other },
+        // Only forward photos that were already uploaded to Drive (have a fileId).
+        Photos: (form.photos || []).filter(p => p && p.fileId),
+        GPSEnabled: !!form.gps_enabled,
+        Lat: form.lat != null ? form.lat : "",
+        Lng: form.lng != null ? form.lng : "",
+        Notes: form.notes || ""
+      };
+      await LTC_API.submitVisit(payload);
       setSaving(false);
       Swal.fire({
         icon: "success",
